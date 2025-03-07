@@ -5,12 +5,14 @@ import pickle
 from copy import deepcopy
 
 from sklearn.cluster import KMeans
-from gpflow.kernels import SquaredExponential, Linear
+from gpflow.models import BayesianModel
+from gpflow.kernels import Coregion, SeparateIndependent
 from gpflow.models import SVGP
 from gpflow.likelihoods import Gaussian
 from gpflow.inducing_variables import InducingPoints, SharedIndependentInducingVariables
 from gpflow.kernels import LinearCoregionalization
-from .linear import LinearMultiFidelityKernel  # Your existing LinearMultiFidelityKernel
+from .linear import LinearMultiFidelityKernel,  FlatLinearMultiFidelityKernel
+from .flat_mf_lmc import FlattenedMultiFidelityLMC
 
 def initialize_W(output_dim, num_latents, window_fraction=0.3, scale=0.1):
     """
@@ -148,4 +150,158 @@ class LatentMFCoregionalizationSVGP(SVGP):
         model = LatentMFCoregionalizationSVGP(*args)
         gpflow.utilities.multiple_assign(model, params)
         print(f"✅ Model loaded from {filename}")
+        return model
+
+class FlattenedLatentMFCoregionalizationSVGP(SVGP):
+    """
+    Multi-Fidelity Sparse Variational GP that:
+      - Accepts flattened data: X.shape=(N, D+2), Y.shape=(N,1).
+        * last column of X => task index, 
+        * second-last column => fidelity,
+        * first D columns => continuous features.
+      - Builds a single 'FlattenedMultiFidelityLMC' kernel that merges:
+         * a list of base multi-fidelity kernels (one per latent),
+         * a learnable mixing matrix W => cross-task correlation,
+         * partial data for outputs => simply omit rows for missing tasks.
+      - This replicates the "LinearCoregionalization" style but 
+        uses a flattened approach with a single kernel call, 
+        enabling missing outputs easily.
+
+    Preserved features from `LatentMFCoregionalizationSVGP`:
+      - Inducing point selection via KMeans
+      - ephemeral "num_latents" can be < num_outputs, i.e. dimension reduction
+    """
+    def __init__(
+        self,
+        X,           # shape (N, D+2) => last two columns = [fidelity, task_index]
+        Y,           # shape (N, 1)
+        kernel_L,    # base kernel for LF part
+        kernel_delta,# kernel for HF discrepancy
+        num_latents, # not used directly if we only want 1 latent in multi-fidelity, but keep for consistency
+        num_outputs, # total number of tasks
+        Z,           # initial guess for M points, shape (M, D+2) or at least (M, D+something)
+        window_fraction=0.4,
+        scale=0.2
+    ):
+
+        """
+        Prameters:
+        - X (np.ndarray): Input data `(N, D+2)`, where `D` is the input dimension.
+                        The last two columns = [fidelity, task_index]
+        - Y (np.ndarray): Output data `(N, 1)`, where `P` is the number of output bins.
+        - kernel_L (gpflow.kernels.Kernel): Kernel for low-fidelity (LF) data.
+        - kernel_delta (gpflow.kernels.Kernel): Kernel for high-fidelity (HF) discrepancy.
+        - num_latents (int): Number of latent GPs `(L)`, typically `L < P`.
+        - num_outputs (int): Number of output dimensions `(P)`, e.g., 49 bins.
+        - Z (np.ndarray): Inducing point locations `(M, D)`, where `M` is the number of inducing points.
+        - window_fraction (float): Fraction of total outputs each latent covers.
+        - scale (float): Scaling factor for initial weights
+        """
+        self.num_outputs = num_outputs
+        self.num_latents = num_latents
+
+        # -------------------------------
+        # 1) Define Multi-Fidelity Kernel
+        #    The 'active_dims' should slice out columns [0..D] for continuous features + fidelity.
+        #    Suppose the last column is the *task* (output) index, so we don't want to feed that to MF kernel.
+        #    So if we have D+2 total columns, then columns [0..D] => D+1 columns used by MF kernel:
+        mf_active_dims = list(range((X.shape[1] - 1)))  # everything except the last column
+        kernel_list = []
+        for _ in range(num_latents):
+            kernel_list.append(FlatLinearMultiFidelityKernel(
+                kernel_L=deepcopy(kernel_L),
+                kernel_delta=deepcopy(kernel_delta),
+                num_output_dims=1,          # or however you structure scaling factors
+                active_dims=mf_active_dims
+            ))
+
+        # 2) Initialize W => shape (P, L)
+        W_init = initialize_W(num_outputs, num_latents, 
+                              window_fraction=window_fraction, 
+                              scale=scale)
+        # -------------------------------
+        # 3) Build a single FlattenedMultiFidelityLMC kernel
+        #    This merges all base_kernels plus the mixing matrix W
+        self.multioutput_kernel = FlattenedMultiFidelityLMC(
+            base_kernels=kernel_list,
+            num_outputs=num_outputs,
+            W_init=W_init
+        )
+
+        # -------------------------------
+        # 4) Use KMeans for Inducing Points
+        kmeans = KMeans(n_clusters=Z.shape[0], random_state=42).fit(X)
+        Z_init = kmeans.cluster_centers_
+        print("🔹 KMeans Inducing Points:", Z_init)
+        inducing_variable = SharedIndependentInducingVariables(InducingPoints(Z_init))
+
+        # -------------------------------
+        # 5) Variational Parameters Initialization
+        q_mu = np.zeros((Z.shape[0], num_latents))  # M × L
+        q_sqrt = np.repeat(np.eye(Z.shape[0])[None, ...], num_latents, axis=0) * 0.1  # L × M × M, scaled down
+
+        # -------------------------------
+        # 6) Define the SVGP
+        likelihood = Gaussian()
+        super().__init__(
+            kernel=self.multioutput_kernel,
+            likelihood=likelihood,
+            inducing_variable=inducing_variable,
+            q_mu=q_mu,
+            q_sqrt=q_sqrt,
+            num_latent_gps=num_latents,
+        )
+
+    def optimize(self, data, max_iters=10000, initial_lr=0.005, unfix_noise_after=5000):
+        """
+        Optimizes the model using Adam with cosine decay.
+
+        Parameters:
+            data (tuple): (X, Y), 
+                X shape (N, D+2), last col is task index, second-last col is fidelity
+                Y shape (N, 1)
+            max_iters (int): Maximum # of optimization iterations.
+            initial_lr (float): Learning rate.
+            unfix_noise_after (int): iteration to unfix noise variance.
+        """
+        X, Y = data
+        optimizer = tf.optimizers.Adam(
+            tf.keras.optimizers.schedules.CosineDecay(initial_lr, max_iters)
+        )
+        self.loss_history = []
+
+        @tf.function
+        def optimization_step():
+            with tf.GradientTape() as tape:
+                loss = -self.elbo((X, Y))
+            grads = tape.gradient(loss, self.trainable_variables)
+            optimizer.apply_gradients(zip(grads, self.trainable_variables))
+            return loss
+
+        print("🔹 Optimizing...")
+        for i in range(max_iters):
+            loss = optimization_step()
+            self.loss_history.append(loss.numpy())
+
+            if i == unfix_noise_after:
+                print("🔹 Unfixing noise variance at iteration", i)
+                gpflow.utilities.set_trainable(self.likelihood.variance, True)
+            if i % 100 == 0:
+                print(f"🔹 Iteration {i}: ELBO = {-self.elbo((X, Y)).numpy()}")
+
+    def save_model(self, filename="latent_mf_svgp_coreg.pkl"):
+        """Saves the trained SVGP model."""
+        params = gpflow.utilities.parameter_dict(self)
+        with open(filename, "wb") as f:
+            pickle.dump(params, f)
+        print(f"✅ Model saved to {filename}")
+
+    @staticmethod
+    def load_model(filename, *args):
+        """Loads an SVGP model from a saved file."""
+        with open(filename, "rb") as f:
+            params = pickle.load(f)
+        model = LatentMFCoregionalizationSVGP(*args)
+        gpflow.utilities.multiple_assign(model, params)
+        print(f"✅ Model loaded from", filename)
         return model
