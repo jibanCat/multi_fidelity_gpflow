@@ -325,8 +325,8 @@ class FlatLinearMultiFidelityKernel(gpflow.kernels.Kernel):
         if X2 is None:
             X2 = X
 
-        X = tf.convert_to_tensor(X, dtype=self.dtype)
-        X2 = tf.convert_to_tensor(X2, dtype=self.dtype)
+        X = tf.convert_to_tensor(X, dtype=tf.float64)
+        X2 = tf.convert_to_tensor(X2, dtype=tf.float64)
 
         # 1) Split out fidelity / dim for each set
         Xf, F1, D1 = self._split_fidelity_dim(X)
@@ -335,7 +335,7 @@ class FlatLinearMultiFidelityKernel(gpflow.kernels.Kernel):
         # 2) We'll build a (N1, N2) covariance matrix K_full.
         N1 = tf.shape(Xf)[0]
         N2 = tf.shape(X2f)[0]
-        K_full = tf.zeros((N1, N2), dtype=self.dtype)
+        K_full = tf.zeros((N1, N2), dtype=tf.float64)
 
         # 3) Identify the subsets of rows that share the same dimension
         #    If D1[i] != D2[j], we want that K[i,j] = 0 (no cross-cov between different output dims)
@@ -409,7 +409,7 @@ class FlatLinearMultiFidelityKernel(gpflow.kernels.Kernel):
         # We'll now assemble them into one block shape (N1, N2).
         N1 = tf.shape(Xf1)[0]
         N2 = tf.shape(Xf2)[0]
-        block = tf.zeros((N1, N2), dtype=self.dtype)
+        block = tf.zeros((N1, N2), dtype=tf.float64)
 
         # Indices:
         row_LL = tf.stack(tf.meshgrid(mask_lf_1, mask_lf_2, indexing='ij'), axis=-1)
@@ -440,7 +440,7 @@ class FlatLinearMultiFidelityKernel(gpflow.kernels.Kernel):
         But each row's dimension => picks which rho[d].
         """
         Xf, F, D = self._split_fidelity_dim(X)
-        Kd = tf.zeros((tf.shape(X)[0],), dtype=self.dtype)
+        Kd = tf.zeros((tf.shape(X)[0],), dtype=tf.float64)
 
         for d in range(self.num_output_dims):
             mask_d = tf.where(tf.equal(D, d))[:, 0]

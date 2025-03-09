@@ -39,23 +39,20 @@ class FlattenedLinearCoreg(gpflow.kernels.Kernel):
     def K(self, X, X2=None):
         if X2 is None:
             X2 = X
-        X = tf.convert_to_tensor(X, dtype=self.dtype)
-        X2 = tf.convert_to_tensor(X2, dtype=self.dtype)
+        X = tf.convert_to_tensor(X, dtype=tf.float64)
+        X2 = tf.convert_to_tensor(X2, dtype=tf.float64)
 
         # parse out the last column => task index
         p1 = tf.cast(X[:, -1], tf.int32)   # shape (N1,)
         p2 = tf.cast(X2[:, -1], tf.int32)  # shape (N2,)
-        # the "features + fidelity" part is everything except the last column
-        Xfeat1 = X[:, :-1]   # shape (N1, D+1)
-        Xfeat2 = X2[:, :-1]  # shape (N2, D+1)
 
         N1 = tf.shape(X)[0]
         N2 = tf.shape(X2)[0]
-        K_full = tf.zeros((N1, N2), dtype=self.dtype)
+        K_full = tf.zeros((N1, N2), dtype=tf.float64)
 
         # sum_{ell} W[p1, ell] * W[p2, ell] * base_kernels[ell].K(x1, x2)
         for ell, bk in enumerate(self.base_kernels):
-            K_ell = bk.K(Xfeat1, Xfeat2)  # shape (N1, N2)
+            K_ell = bk.K(X, X2) # shape (N1, N2)
             w1 = tf.gather(self.W[:, ell], p1)  # (N1,) => gather row p1[i], col=ell
             w2 = tf.gather(self.W[:, ell], p2)  # (N2,)
             # outer product
@@ -65,11 +62,11 @@ class FlattenedLinearCoreg(gpflow.kernels.Kernel):
         return K_full
 
     def K_diag(self, X):
-        X = tf.convert_to_tensor(X, dtype=self.dtype)
+        X = tf.convert_to_tensor(X, dtype=tf.float64)
         p = tf.cast(X[:, -1], tf.int32)
         Xfeat = X[:, :-1]
         N = tf.shape(X)[0]
-        Kd = tf.zeros((N,), dtype=self.dtype)
+        Kd = tf.zeros((N,), dtype=tf.float64)
 
         # sum_{ell} W[p,ell]^2 * base_kernels[ell].K_diag(x)
         for ell, bk in enumerate(self.base_kernels):

@@ -188,7 +188,7 @@ class FlattenedLatentMFCoregionalizationSVGP(SVGP):
         Prameters:
         - X (np.ndarray): Input data `(N, D+2)`, where `D` is the input dimension.
                         The last two columns = [fidelity, task_index]
-        - Y (np.ndarray): Output data `(N, 1)`, where `P` is the number of output bins.
+        - Y (np.ndarray): Output data `(N, 1)`, where  `N = N_points * P` and `P` is the number of output bins.
         - kernel_L (gpflow.kernels.Kernel): Kernel for low-fidelity (LF) data.
         - kernel_delta (gpflow.kernels.Kernel): Kernel for high-fidelity (HF) discrepancy.
         - num_latents (int): Number of latent GPs `(L)`, typically `L < P`.
@@ -202,17 +202,14 @@ class FlattenedLatentMFCoregionalizationSVGP(SVGP):
 
         # -------------------------------
         # 1) Define Multi-Fidelity Kernel
-        #    The 'active_dims' should slice out columns [0..D] for continuous features + fidelity.
         #    Suppose the last column is the *task* (output) index, so we don't want to feed that to MF kernel.
         #    So if we have D+2 total columns, then columns [0..D] => D+1 columns used by MF kernel:
-        mf_active_dims = list(range((X.shape[1] - 1)))  # everything except the last column
         kernel_list = []
         for _ in range(num_latents):
             kernel_list.append(FlatLinearMultiFidelityKernel(
                 kernel_L=deepcopy(kernel_L),
                 kernel_delta=deepcopy(kernel_delta),
                 num_output_dims=1,          # or however you structure scaling factors
-                active_dims=mf_active_dims
             ))
 
         # 2) Initialize W => shape (P, L)
@@ -234,8 +231,9 @@ class FlattenedLatentMFCoregionalizationSVGP(SVGP):
         # 4) Use KMeans for Inducing Points
         kmeans = KMeans(n_clusters=Z.shape[0], random_state=42).fit(X)
         Z_init = kmeans.cluster_centers_
-        print("🔹 KMeans Inducing Points:", Z_init)
-        inducing_variable = SharedIndependentInducingVariables(InducingPoints(Z_init))
+        #print("🔹 KMeans Inducing Points:", Z_init)
+        #inducing_variable = SharedIndependentInducingVariables(InducingPoints(Z_init))
+        inducing_variable = InducingPoints(Z_init)
 
         # -------------------------------
         # 5) Variational Parameters Initialization
@@ -267,6 +265,7 @@ class FlattenedLatentMFCoregionalizationSVGP(SVGP):
             unfix_noise_after (int): iteration to unfix noise variance.
         """
         X, Y = data
+        print(f" X shape: {X.shape}, Y shape: {Y.shape}")
         optimizer = tf.optimizers.Adam(
             tf.keras.optimizers.schedules.CosineDecay(initial_lr, max_iters)
         )
