@@ -3,19 +3,19 @@ import tensorflow as tf
 import numpy as np
 from gpflow.utilities import positive
 
-class FlattenedMultiFidelityLMC(gpflow.kernels.Kernel):
+class FlattenedLinearCoreg(gpflow.kernels.Kernel):
     """
-    A flattened LMC kernel that combines:
+    A flattened Linear Coregionalization kernel that combines:
       - multiple base "multi-fidelity" kernels (one per latent),
       - a learnable mixing matrix W of shape (num_outputs, num_latents),
-      - a final "task index" column in X to pick the appropriate row(s) of W.
+      - a final "task index"/"output" column in X to pick the appropriate row(s) of W.
     
     The data X is shaped (N, D+2):
       - The last column: integer task index p in [0..num_outputs-1].
       - The second-last column: fidelity (0=LF,1=HF) or more advanced logic if your base kernel supports it.
       - The first D columns: continuous features, if any.
     
-    Summation logic:
+    Summation logic: The N1*N2 kernel matrix K(X1, X2) is weighted sum of base kernels in each latent:
       K((x_i,p_i), (x_j,p_j)) = sum_{ell=1..L} [W[p_i, ell] * W[p_j, ell] * base_kernels[ell].K(x_i, x_j)].
     """
     def __init__(self, base_kernels, num_outputs, W_init=None):

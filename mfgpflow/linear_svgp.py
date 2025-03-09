@@ -12,7 +12,7 @@ from gpflow.likelihoods import Gaussian
 from gpflow.inducing_variables import InducingPoints, SharedIndependentInducingVariables
 from gpflow.kernels import LinearCoregionalization
 from .linear import LinearMultiFidelityKernel,  FlatLinearMultiFidelityKernel
-from .flat_mf_lmc import FlattenedMultiFidelityLMC
+from .flat_mf_lmc import FlattenedLinearCoreg
 
 def initialize_W(output_dim, num_latents, window_fraction=0.3, scale=0.1):
     """
@@ -220,9 +220,11 @@ class FlattenedLatentMFCoregionalizationSVGP(SVGP):
                               window_fraction=window_fraction, 
                               scale=scale)
         # -------------------------------
-        # 3) Build a single FlattenedMultiFidelityLMC kernel
+        # 3) Build a single Flattened Linear Coregionalization kernel
         #    This merges all base_kernels plus the mixing matrix W
-        self.multioutput_kernel = FlattenedMultiFidelityLMC(
+        #    Similar to LinearCoregionalization but takes flattened data
+        #    useful for missing outputs
+        self.multioutput_kernel = FlattenedLinearCoreg(
             base_kernels=kernel_list,
             num_outputs=num_outputs,
             W_init=W_init

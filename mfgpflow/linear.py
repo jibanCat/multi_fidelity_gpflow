@@ -288,9 +288,8 @@ class FlatLinearMultiFidelityKernel(gpflow.kernels.Kernel):
     A multifidelity kernel that:
      - interprets X[..., -2] as fidelity (0=LF,1=HF)
      - interprets X[..., -1] as dimension index dim in {0..P-1}
-     - uses sub-kernels for LF and discrepancy
-     - uses a separate scaling rho[d] for each dimension
-     - does *not* rely on ith_output_dim
+    Similar to `LinearMultiFidelityKernel`, but with a flattened data which
+    allows for missing data for some dimensions.
     """
 
     def __init__(self, kernel_L, kernel_delta, num_output_dims):
@@ -320,6 +319,9 @@ class FlatLinearMultiFidelityKernel(gpflow.kernels.Kernel):
         return X_features, fidelity, dim_index
 
     def K(self, X, X2=None):
+        """
+        Construct the full covariance matrix for multi-fidelity modeling.
+        """
         if X2 is None:
             X2 = X
 
