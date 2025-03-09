@@ -285,183 +285,84 @@ class MultiFidelityGPModel(gpflow.models.GPR):
 
 class FlatLinearMultiFidelityKernel(gpflow.kernels.Kernel):
     """
-    A multifidelity kernel that:
-     - interprets X[..., -2] as fidelity (0=LF,1=HF)
-     - interprets X[..., -1] as dimension index dim in {0..P-1}
-    Similar to `LinearMultiFidelityKernel`, but with a flattened data which
-    allows for missing data for some dimensions.
+    Interprets X.shape=(N, D+1) => last column is fidelity=0/1,
+    ignoring any final "task index" column that might exist.
+    
+    If you pass X with shape (N, D+2), we STILL only parse up to -1,
+    ignoring that final dimension index. That final col is used by
+    FlattenedLinearCoreg, not by this MF kernel.
+
+    Multi-fidelity logic:
+      f_H(x) = rho * f_L(x) + discrepancy
+      => K_HH = rho^2 K_L + K_delta
+      => Cross HF–LF = rho * K_L
     """
 
-    def __init__(self, kernel_L, kernel_delta, num_output_dims):
+    def __init__(self, kernel_L, kernel_delta):
         super().__init__()
-        self.kernel_L = kernel_L      # Low-fidelity kernel
-        self.kernel_delta = kernel_delta
-        # We'll store a separate scale factor for each dimension:
-        self.rho = gpflow.Parameter(
-            tf.ones([num_output_dims, 1], dtype=tf.float64),
-            transform=positive()
-        )
-
-        self.num_output_dims = num_output_dims
-
-    def _split_fidelity_dim(self, X):
-        """
-        Utility: separate 'fidelity' and 'dim_index' from the main features.
-        X shape = (N, D+2).
-          - X[:, :D]   = actual features
-          - X[:, -2]   = fidelity (0 or 1)
-          - X[:, -1]   = dimension index
-        Returns (X_features, fidelity, dim_index).
-        """
-        X_features = X[..., :-2]
-        fidelity   = X[..., -2]
-        dim_index  = X[..., -1]
-        return X_features, fidelity, dim_index
+        self.kernel_L     = kernel_L      # GP kernel for LF
+        self.kernel_delta = kernel_delta  # GP kernel for discrepancy
+        # A single scalar scale for HF= rho * LF
+        self.rho = gpflow.Parameter(1.0, transform=positive())
 
     def K(self, X, X2=None):
-        """
-        Construct the full covariance matrix for multi-fidelity modeling.
-        """
+        #print(f"MF K() called with X.shape={X.shape}, X2.shape={X2.shape}")
         if X2 is None:
             X2 = X
+        # We'll ignore the last column (task index) altogether
+        # => parse up to -1 so that second-last is fidelity
+        # -> X[..., :D] = features
+        # -> X[...,  D] = fidelity
+        mask_L = tf.where(X[:, -1] == 0)[:, 0]   # LF
+        mask_H = tf.where(X[:, -1]  == 1)[:, 0]   # HF
+        mask2_L= tf.where(X2[:, -1] == 0)[:, 0]
+        mask2_H= tf.where(X2[:, -1] == 1)[:, 0]
 
-        X = tf.convert_to_tensor(X, dtype=tf.float64)
-        X2 = tf.convert_to_tensor(X2, dtype=tf.float64)
+        Xf_L  = tf.gather(X[:, :-1],  mask_L)   # LF features
+        Xf_H  = tf.gather(X[:, :-1],  mask_H)
+        X2f_L = tf.gather(X2[:, :-1], mask2_L)
+        X2f_H = tf.gather(X2[:, :-1], mask2_H)
 
-        # 1) Split out fidelity / dim for each set
-        Xf, F1, D1 = self._split_fidelity_dim(X)
-        X2f, F2, D2 = self._split_fidelity_dim(X2)
 
-        # 2) We'll build a (N1, N2) covariance matrix K_full.
-        N1 = tf.shape(Xf)[0]
-        N2 = tf.shape(X2f)[0]
+        N1 = tf.shape(X)[0]
+        N2 = tf.shape(X2)[0]
         K_full = tf.zeros((N1, N2), dtype=tf.float64)
 
-        # 3) Identify the subsets of rows that share the same dimension
-        #    If D1[i] != D2[j], we want that K[i,j] = 0 (no cross-cov between different output dims)
-        #    Or we might want some correlation. For now, let's do block-diagonal structure (0 if dims differ).
-        #
-        #    If you'd rather have correlation across different dims, you can implement it
-        #    by adding some B[dim1, dim2] factor. We'll keep it simple.
-        for d in range(self.num_output_dims):
-            # Indices where X dim_index = d
-            mask_1 = tf.where(tf.equal(D1, d))[:, 0]
-            # Indices where X2 dim_index = d
-            mask_2 = tf.where(tf.equal(D2, d))[:, 0]
+        # Build submatrices
+        K_LL = self.kernel_L.K(Xf_L,  X2f_L)
+        K_LH = self.kernel_L.K(Xf_L,  X2f_H) * self.rho
+        K_HL = self.kernel_L.K(Xf_H,  X2f_L) * self.rho
+        K_HH = self.kernel_L.K(Xf_H,  X2f_H) * (self.rho ** 2) + self.kernel_delta.K(Xf_H, X2f_H)
 
-            # Gather those subsets
-            Xf_d  = tf.gather(Xf,  mask_1)
-            F1_d  = tf.gather(F1,  mask_1)
-            X2f_d = tf.gather(X2f, mask_2)
-            F2_d  = tf.gather(F2,  mask_2)
+        # Indices for insertion
+        idx_LL = tf.stack(tf.meshgrid(mask_L,  mask2_L,  indexing="ij"), axis=-1)
+        idx_LH = tf.stack(tf.meshgrid(mask_L,  mask2_H,  indexing="ij"), axis=-1)
+        idx_HL = tf.stack(tf.meshgrid(mask_H,  mask2_L,  indexing="ij"), axis=-1)
+        idx_HH = tf.stack(tf.meshgrid(mask_H,  mask2_H,  indexing="ij"), axis=-1)
 
-            # We can now form the block K for these subsets. 
-            # Inside each dimension d, we do a multi-fidelity approach:
-            #   - If F1_d[i]==0 and F2_d[j]==0 => both LF => use kernel_L
-            #   - If one is HF => scale or add discrepancy kernel
-            # Then multiply by rho[d].
-            # We'll show a simplified approach:
-            K_block = self._mf_block(Xf_d, F1_d, X2f_d, F2_d, d)
-
-            # Then place K_block into the correct rows/cols of K_full
-            # We use tf.tensor_scatter_nd_update to assign those sub-blocks.
-            # Let's create the index grids:
-            I1 = tf.reshape(mask_1, [-1, 1])  # shape (n1, 1)
-            I2 = tf.reshape(mask_2, [-1, 1])  # shape (n2, 1)
-            grid_1, grid_2 = tf.meshgrid(I1[:,0], I2[:,0], indexing="ij") 
-            # We'll stack them as (n1*n2, 2)
-            idx_pairs = tf.stack([tf.reshape(grid_1, [-1]), tf.reshape(grid_2, [-1])], axis=-1)
-
-            # Flatten K_block for scatter
-            K_block_flat = tf.reshape(K_block, [-1])
-            K_full = tf.tensor_scatter_nd_update(K_full, idx_pairs, K_block_flat)
+        K_full = tf.tensor_scatter_nd_update(K_full, tf.reshape(idx_LL, [-1,2]), tf.reshape(K_LL, [-1]))
+        K_full = tf.tensor_scatter_nd_update(K_full, tf.reshape(idx_LH, [-1,2]), tf.reshape(K_LH, [-1]))
+        K_full = tf.tensor_scatter_nd_update(K_full, tf.reshape(idx_HL, [-1,2]), tf.reshape(K_HL, [-1]))
+        K_full = tf.tensor_scatter_nd_update(K_full, tf.reshape(idx_HH, [-1,2]), tf.reshape(K_HH, [-1]))
 
         return K_full
 
-    def _mf_block(self, Xf1, F1, Xf2, F2, d):
-        """
-        Build the sub-covariance for dimension d. 
-        We interpret F1=0 => LF, F1=1 => HF, similarly for F2.
-        Then apply your multi-fidelity formula with self.kernel_L, self.kernel_delta,
-        plus the scaling factor rho[d].
-        """
-        rho_d = self.rho[d, 0]  # scalar
-
-        # Let's gather the subsets:
-        #   For row-block: LF vs HF
-        mask_lf_1 = tf.where(tf.equal(F1, 0))[:, 0]
-        mask_hf_1 = tf.where(tf.equal(F1, 1))[:, 0]
-        Xf1_lf = tf.gather(Xf1, mask_lf_1)
-        Xf1_hf = tf.gather(Xf1, mask_hf_1)
-
-        #   For col-block: LF vs HF
-        mask_lf_2 = tf.where(tf.equal(F2, 0))[:, 0]
-        mask_hf_2 = tf.where(tf.equal(F2, 1))[:, 0]
-        Xf2_lf = tf.gather(Xf2, mask_lf_2)
-        Xf2_hf = tf.gather(Xf2, mask_hf_2)
-
-        # Cov sub-blocks
-        K_LL = self.kernel_L.K(Xf1_lf, Xf2_lf)
-        K_LH = self.kernel_L.K(Xf1_lf, Xf2_hf) * rho_d
-        K_HL = self.kernel_L.K(Xf1_hf, Xf2_lf) * rho_d
-        K_HH = self.kernel_L.K(Xf1_hf, Xf2_hf) * (rho_d**2) + self.kernel_delta.K(Xf1_hf, Xf2_hf)
-
-        # We'll now assemble them into one block shape (N1, N2).
-        N1 = tf.shape(Xf1)[0]
-        N2 = tf.shape(Xf2)[0]
-        block = tf.zeros((N1, N2), dtype=tf.float64)
-
-        # Indices:
-        row_LL = tf.stack(tf.meshgrid(mask_lf_1, mask_lf_2, indexing='ij'), axis=-1)
-        row_LH = tf.stack(tf.meshgrid(mask_lf_1, mask_hf_2, indexing='ij'), axis=-1)
-        row_HL = tf.stack(tf.meshgrid(mask_hf_1, mask_lf_2, indexing='ij'), axis=-1)
-        row_HH = tf.stack(tf.meshgrid(mask_hf_1, mask_hf_2, indexing='ij'), axis=-1)
-
-        block = tf.tensor_scatter_nd_update(block, 
-                tf.reshape(row_LL, [-1, 2]), 
-                tf.reshape(K_LL, [-1]))
-        block = tf.tensor_scatter_nd_update(block, 
-                tf.reshape(row_LH, [-1, 2]), 
-                tf.reshape(K_LH, [-1]))
-        block = tf.tensor_scatter_nd_update(block, 
-                tf.reshape(row_HL, [-1, 2]), 
-                tf.reshape(K_HL, [-1]))
-        block = tf.tensor_scatter_nd_update(block, 
-                tf.reshape(row_HH, [-1, 2]), 
-                tf.reshape(K_HH, [-1]))
-
-        return block
-
     def K_diag(self, X):
-        """
-        Diagonal elements. 
-        We do a simpler version: if fidelity=0 => kernel_L diag,
-        if fidelity=1 => (rho^2 kernel_L diag + kernel_delta diag).
-        But each row's dimension => picks which rho[d].
-        """
-        Xf, F, D = self._split_fidelity_dim(X)
-        Kd = tf.zeros((tf.shape(X)[0],), dtype=tf.float64)
+        # ignore last column (task index)
+        X = tf.convert_to_tensor(X[..., :-1], dtype=tf.float64)
+        mask_L = tf.where(X[:, -1] == 0)[:, 0]
+        mask_H = tf.where(X[:, -1] == 1)[:, 0]
 
-        for d in range(self.num_output_dims):
-            mask_d = tf.where(tf.equal(D, d))[:, 0]
-            Xf_d = tf.gather(Xf, mask_d)
-            F_d  = tf.gather(F,  mask_d)
-            rho_d = self.rho[d, 0]
+        Xf_L = tf.gather(X[:, :-1], mask_L)
+        Xf_H = tf.gather(X[:, :-1], mask_H)
 
-            # Sub-block:
-            mask_lf = tf.where(tf.equal(F_d, 0))[:, 0]
-            mask_hf = tf.where(tf.equal(F_d, 1))[:, 0]
+        N  = tf.shape(X)[0]
+        Kd = tf.zeros((N,), dtype=tf.float64)
 
-            Xf_d_lf = tf.gather(Xf_d, mask_lf)
-            Xf_d_hf = tf.gather(Xf_d, mask_hf)
+        kd_L = self.kernel_L.K_diag(Xf_L)
+        kd_H = self.kernel_L.K_diag(Xf_H) * (self.rho ** 2) + self.kernel_delta.K_diag(Xf_H)
 
-            K_diag_lf = self.kernel_L.K_diag(Xf_d_lf)
-            K_diag_hf = self.kernel_L.K_diag(Xf_d_hf) * (rho_d**2) + self.kernel_delta.K_diag(Xf_d_hf)
-
-            # Place them:
-            idx_lf = tf.gather(mask_d, mask_lf)
-            idx_hf = tf.gather(mask_d, mask_hf)
-            Kd = tf.tensor_scatter_nd_update(Kd, tf.reshape(idx_lf, [-1, 1]), tf.reshape(K_diag_lf, [-1]))
-            Kd = tf.tensor_scatter_nd_update(Kd, tf.reshape(idx_hf, [-1, 1]), tf.reshape(K_diag_hf, [-1]))
+        Kd = tf.tensor_scatter_nd_update(Kd, tf.reshape(mask_L, [-1,1]), tf.reshape(kd_L, [-1]))
+        Kd = tf.tensor_scatter_nd_update(Kd, tf.reshape(mask_H, [-1,1]), tf.reshape(kd_H, [-1]))
 
         return Kd

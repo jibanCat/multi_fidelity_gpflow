@@ -208,8 +208,7 @@ class FlattenedLatentMFCoregionalizationSVGP(SVGP):
         for _ in range(num_latents):
             kernel_list.append(FlatLinearMultiFidelityKernel(
                 kernel_L=deepcopy(kernel_L),
-                kernel_delta=deepcopy(kernel_delta),
-                num_output_dims=1,          # or however you structure scaling factors
+                kernel_delta=deepcopy(kernel_delta)
             ))
 
         # 2) Initialize W => shape (P, L)
