@@ -4,6 +4,7 @@ Data loader for the matter power spectrum
 
 import os, json
 from typing import List, Optional
+import re
 
 import numpy as np
 import h5py
@@ -526,6 +527,82 @@ class StellarMassFunctions(PowerSpecs):
 
 
     @property
+    def Y_train_log10(self):
+        """
+        Transform from log1p to log10, and filling up the zero bins with minimum.
+        """
+        y_train_log10 = []
+
+        for y_train in self.Y_train:
+            # Assume the log1p in data
+            y_train_linear = np.expm1(y_train)
+            # check if there are zeros
+            ind = y_train_linear == 0
+            if np.any(ind):
+                # fill the zeros with minimum
+                min_nonzero = np.min(y_train_linear[y_train_linear > 0])
+                print("Warning: There are zeros in the data. filling them with minimum. ", min_nonzero)
+                y_train_linear[ind] = min_nonzero
+                self.min_nonzero = min_nonzero
+
+            y_train_log10.append(np.log10(y_train_linear))
+
+        return y_train_log10
+
+    @property
+    def Y_test_log10(self):
+        """
+        Transform from log1p to log10, and filling up the zero bins with minimum.
+        """
+        y_test_log10 = []
+
+        for y_test in self.Y_test:
+            # Assume the log1p in data
+            y_test_linear = np.expm1(y_test)
+            # check if there are zeros
+            ind = y_test_linear == 0
+            if np.any(ind):
+                # fill the zeros with minimum
+                min_nonzero = np.min(y_test_linear[y_test_linear > 0])
+                print("Warning: There are zeros in the data. filling them with minimum. ", min_nonzero)
+                y_test_linear[ind] = min_nonzero
+                self.min_nonzero = min_nonzero
+
+            y_test_log10.append(np.log10(y_test_linear))
+
+        return y_test_log10
+
+    @property
+    def Y_train_norm_log10(self):
+        """
+        Normalized training output. Subtract the low-fidelity data with
+        their sample mean. Don't change high-fidelity data.
+        """
+        y_train_norm = []
+        for y_train in self.Y_train_log10[:-1]:
+            mean = y_train.mean(axis=0)
+            y_train_norm.append(y_train - mean)
+
+        # don't change high-fidelity data
+        y_train_norm.append(self.Y_train_log10[-1])
+
+        return y_train_norm
+    
+    @property
+    def Y_test_norm_log10(self):
+        """
+        Normalized test output. Subtract the low-fidelity data with
+        their sample mean. Don't change high-fidelity data.
+        """
+        y_test_norm = []
+        for y_test in self.Y_test_log10:
+            mean = y_test.mean(axis=0)
+            y_test_norm.append(y_test - mean)
+        
+        return y_test_norm
+
+
+    @property
     def Y_train_norm(self):
         """
         Normalized training output. Subtract the low-fidelity data with
@@ -556,3 +633,221 @@ class StellarMassFunctions(PowerSpecs):
         y_train_norm.append(self.Y_train[-1])
 
         return y_train_norm
+
+class SMFDataLoader:
+    def __init__(
+        self,
+        param_file,
+        lh_smf_file,
+        low_smf_file,
+        high_smf_file,
+        additional_low_smf_files=None,
+        additional_high_smf_files=None,
+        param_names=None,
+    ):
+        self.param_file = param_file
+        self.lh_smf_file = lh_smf_file
+        self.low_smf_file = low_smf_file
+        self.high_smf_file = high_smf_file
+        self.additional_low_smf_files = additional_low_smf_files or []
+        self.additional_high_smf_files = additional_high_smf_files or []
+        self.param_names = param_names or [
+            "Omega_m",
+            "sigma_8",
+            "A_SN1",
+            "A_AGN1",
+            "A_SN2",
+            "A_AGN2",
+        ]
+
+        self.lh_smfs = None
+        self.low_smfs = None
+        self.high_smfs = None
+        self.params_values = None
+        self.pair_param_values = None
+        self.parameter_limits = np.array(
+            [
+                (0.1, 0.5),  # Omega_8
+                (0.6, 1.0),  # sigma_8
+                (0.25, 4.0),  # A_SN1
+                (0.25, 4.0),  # A_AGN1
+                (0.50, 2.0),  # A_SN2
+                (0.50, 2.0),  # A_AGN2
+            ]
+        )
+
+        self.log10_mass_bins = np.array(
+            [8.15, 8.45, 8.75, 9.05, 9.35, 9.65, 9.95, 10.25, 10.55, 10.85]
+        )
+        self.mass_bins = 10**self.log10_mass_bins
+        self.load_data()
+
+    def load_data(self):
+        # Read parameters
+        size = 1000
+        n_params = 6
+        self.params_values = np.full((size, n_params), fill_value=np.nan)
+
+        with open(self.param_file, "r") as f:
+            for line in f.readlines():
+                line = line.replace("\n", "").split(" ")
+                line = list(filter(lambda l: l != "", line))
+
+                if "LH" in line[0]:
+                    re_find = re.findall("LH_([0-9]+)", line[0])
+                    num = int(re_find[0])
+                    values = np.array(list(map(lambda l: float(l), line[1:-1])))
+                    self.params_values[num, :] = values
+
+        # Read SMF data
+        self.lh_smfs = np.load(self.lh_smf_file)
+        self.low_smfs = np.load(self.low_smf_file)
+        self.high_smfs = np.load(self.high_smf_file)
+
+        for lf_file in self.additional_low_smf_files:
+            self.low_smfs = np.concatenate([self.low_smfs, np.load(lf_file)])
+
+        for hf_file in self.additional_high_smf_files:
+            self.high_smfs = np.concatenate([self.high_smfs, np.load(hf_file)])
+
+        # Concatenate the LF-HF paired simulations
+        optimal_index = np.array(
+            [596, 623, 329, 188]
+        )  # Change this to your specific indices
+        self.pair_param_values = np.array(
+            [
+                [
+                    0.23470767,
+                    0.68477296,
+                    0.29091749,
+                    1.37444453,
+                    0.52004166,
+                    1.38033561,
+                ],
+                [
+                    0.25516079,
+                    0.97785488,
+                    0.47781017,
+                    0.41655329,
+                    0.53097153,
+                    1.11179847,
+                ],
+                [
+                    0.39536673,
+                    0.85751988,
+                    2.09561002,
+                    0.27822487,
+                    0.51237612,
+                    1.27292889,
+                ],
+                [
+                    0.40583122,
+                    0.66674317,
+                    0.82548774,
+                    3.53390616,
+                    0.84607057,
+                    0.75517335,
+                ],
+            ]
+        )
+        self.pair_param_values = np.concatenate(
+            [self.pair_param_values, self.params_values[optimal_index]]
+        )
+
+        # assign optimal index :
+        self.optimal_index = np.full(
+            (len(self.pair_param_values),), fill_value=-1
+        ).astype(int)
+        self.optimal_index[len(self.pair_param_values) - len(optimal_index) :] = (
+            optimal_index
+        )
+        # index indicating the elements of the optimal parameter set in the pair_param_values array
+        self.order_optimal_index = np.arange(len(self.pair_param_values))[
+            len(self.pair_param_values) - len(optimal_index) :
+        ]
+
+        # remove the optimal parameter set from the parameter values
+        self.params_values = np.delete(
+            self.params_values,
+            self.optimal_index[self.optimal_index != -1],
+            axis=0,
+        )
+
+        # Add the pair parameter values to the parameter values
+        self.params_values = np.concatenate(
+            [self.params_values, self.pair_param_values]
+        )
+
+        # For the SMF, also remove the optimal index SMFs
+        self._Y_lf = np.delete(
+            self.lh_smfs, self.optimal_index[self.optimal_index != -1], axis=0
+        )
+        self._Y_lf = np.concatenate([self._Y_lf, self.low_smfs])
+        # This is simple, as there is on LH set for the high fidelity SMF
+        self._Y_hf = self.high_smfs
+
+    @property
+    def Y_lf(self):
+        """Returns the low fidelity SMF data, this is LF + additional LF."""
+        return self._Y_lf
+
+    @property
+    def Y_hf(self):
+        """Returns the high fidelity SMF data."""
+        return self._Y_hf
+
+    @property
+    def empirical_smf_uncertainty(self):
+        """This is estimated by the difference between the optimal and the LH set SMFs."""
+        diff = (
+            self.low_smfs[self.order_optimal_index]
+            / self.lh_smfs[self.optimal_index[self.optimal_index != -1]]
+            - 1
+        )
+        return np.abs(diff).mean(axis=0)
+
+    def plot_smf(self, idx, ax):
+        """Plots the low and high fidelity SMFs for a given parameter set index, with dashed lines for LH set."""
+        # Plot the low and high SMFs
+        ax.plot(self.log10_mass_bins, self.low_smfs[idx, :], label="Low")
+        ax.plot(self.log10_mass_bins, self.high_smfs[idx, :], label="High")
+
+        # Plot dashed line for LH set Low SMF
+        if idx in self.order_optimal_index:
+            # This indicate the potential inherent numerical error in calculating SMF
+            ax.plot(
+                self.log10_mass_bins,
+                self.lh_smfs[self.optimal_index[idx], :],
+                ls="--",
+                color="C0",
+                label="LH set Low SMF",
+            )
+
+        # Plot the empirical uncertainty as 1 sigma error bars
+        ax.fill_between(
+            self.log10_mass_bins,
+            self.low_smfs[idx, :] * (1 + self.empirical_smf_uncertainty),
+            self.low_smfs[idx, :] * (1 - self.empirical_smf_uncertainty),
+            alpha=0.3,
+            color="C0",
+        )
+
+        ax.set_xlabel("log10 (M) [$M_\odot$]")
+        ax.set_ylabel("Stellar Mass Function")
+        ax.set_title(
+            "|".join(
+                [
+                    f"{pn}: {value:.2g}"
+                    for pn, value in zip(self.param_names, self.pair_param_values[idx])
+                ]
+            )
+        )
+        ax.legend()
+
+    def plot_all_smf(self):
+        """Creates subplots for all SMF data."""
+        fig, ax = plt.subplots(4, 2, figsize=(20, 30))
+        for i in range(len(self.pair_param_values)):
+            row, col = divmod(i, 2)
+            self.plot_smf(i, ax[row, col])
+        plt.tight_layout()

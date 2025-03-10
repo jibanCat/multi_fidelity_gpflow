@@ -72,14 +72,30 @@ class MFGPDistiller:
         """
         weights = 1 / (sigma_HF + 1e-6)
         weights /= weights.sum()
+        # if multiple outputs, use the mean weight
+        if len(sigma_HF.shape) > 1:
+            weights = weights.mean(axis=1)
+            weights /= weights.sum()
         selected_indices = np.random.choice(np.arange(len(mu_LF)), size=sample_size, p=weights)
         
-        train_data = pd.DataFrame({
-            'mu_LF': mu_LF[selected_indices], 
-            'x': x[selected_indices],
-            'mu_HF': mu_HF[selected_indices],
-            'sigma_HF': sigma_HF[selected_indices]
-        })
+        # multi-dimensional input
+        if len(x.shape) > 1:
+            data_dict = {
+                'mu_LF': mu_LF[selected_indices], 
+                'mu_HF': mu_HF[selected_indices],
+                'sigma_HF': sigma_HF[selected_indices]
+            }
+            # adding xi features
+            for i in range(x.shape[1]):
+                data_dict[f'x{i}'] = x[selected_indices, i]
+            train_data = pd.DataFrame(data_dict)
+        else:
+            train_data = pd.DataFrame({
+                'mu_LF': mu_LF[selected_indices], 
+                'x': x[selected_indices],
+                'mu_HF': mu_HF[selected_indices],
+                'sigma_HF': sigma_HF[selected_indices]
+            })
         return train_data
     
     def train(self, train_data):
@@ -89,11 +105,21 @@ class MFGPDistiller:
         Parameters:
         - train_data: Pandas DataFrame with columns (mu_LF, x, mu_HF, sigma_HF).
         """
-        self.model.fit(
-            train_data[['mu_LF', 'x']],
-            train_data['mu_HF'],
-            weights=train_data['sigma_HF']
-        )
+        # check if the data has multiple input features
+        if 'x' in train_data.columns:
+            self.model.fit(
+                train_data[['mu_LF', 'x']],
+                train_data['mu_HF'],
+                weights=train_data['sigma_HF']
+            )
+        else:
+            query = [f'x{i}' for i in range(train_data.shape[1] - 3)]
+            self.model.fit(
+                train_data[['mu_LF'] + query],
+                train_data['mu_HF'],
+                weights=train_data['sigma_HF']
+            )
+
         self.trained = True
     
     def predict(self, mu_LF, x):
@@ -110,7 +136,12 @@ class MFGPDistiller:
         if not self.trained:
             raise ValueError("Model must be trained before making predictions.")
         
-        data = pd.DataFrame({'mu_LF': mu_LF, 'x': x})
+        if len(x.shape) > 1:
+            data = pd.DataFrame({'mu_LF': mu_LF})
+            for i in range(x.shape[1]):
+                data[f'x{i}'] = x[:, i]
+        else:
+            data = pd.DataFrame({'mu_LF': mu_LF, 'x': x})
         return self.model.predict(data)
     
     def get_equation(self):
