@@ -55,7 +55,7 @@ class LatentMFCoregionalizationSVGP(SVGP):
     - **Stable Optimization** using better parameter initialization.
     """
 
-    def __init__(self, X, Y, kernel_L, kernel_delta, num_latents, num_outputs, Z, window_fraction=0.4, scale=0.2):
+    def __init__(self, X, Y, kernel_L, kernel_delta, num_latents, num_inducing, num_outputs, window_fraction=0.4, scale=0.2):
         """
         Initializes the Multi-Fidelity SVGP model.
 
@@ -86,14 +86,14 @@ class LatentMFCoregionalizationSVGP(SVGP):
         multioutput_kernel = LinearCoregionalization(kernel_list, W=W)
 
         # ✅ Use KMeans to Find Good Inducing Points
-        kmeans = KMeans(n_clusters=Z.shape[0], random_state=42).fit(X)
+        kmeans = KMeans(n_clusters=num_inducing, random_state=42).fit(X)
         Z_init = kmeans.cluster_centers_
         print("🔹 KMeans Inducing Points:", Z_init)
         inducing_variable = SharedIndependentInducingVariables(InducingPoints(Z_init))
 
         # ✅ Variational Parameters Initialization
-        q_mu = np.zeros((Z.shape[0], num_latents))  # M × L
-        q_sqrt = np.repeat(np.eye(Z.shape[0])[None, ...], num_latents, axis=0) * 0.1  # L × M × M, scaled down
+        q_mu = np.zeros((num_inducing, num_latents))  # M × L
+        q_sqrt = np.repeat(np.eye(num_inducing)[None, ...], num_latents, axis=0) * 0.1  # L × M × M, scaled down
 
         # ✅ Define SVGP Model
         likelihood = Gaussian()
