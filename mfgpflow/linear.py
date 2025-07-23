@@ -9,7 +9,6 @@ from check_shapes import check_shapes, inherit_check_shapes
 from gpflow import posteriors
 from gpflow.base import InputData, MeanAndVariance, RegressionData, TensorData
 
-
 class LinearMultiFidelityKernel(gpflow.kernels.Kernel):
     """
     Linear Multi-Fidelity Kernel (Kennedy & O’Hagan, 2000).
@@ -83,7 +82,6 @@ class LinearMultiFidelityKernel(gpflow.kernels.Kernel):
         indices_LH = tf.stack(tf.meshgrid(mask_L, mask2_H, indexing="ij"), axis=-1)
         indices_HL = tf.stack(tf.meshgrid(mask_H, mask2_L, indexing="ij"), axis=-1)
         indices_HH = tf.stack(tf.meshgrid(mask_H, mask2_H, indexing="ij"), axis=-1)
-
         # Extract rho for this output dimension
         rho_i = self.rho[ith_output_dim, :]  # Shape: (1,)
 
