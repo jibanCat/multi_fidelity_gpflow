@@ -34,11 +34,21 @@ def run_experiment(data, num_LF, num_HF, holdout_idx, output_folder, num_latents
         num_inducing (int): Number of inducing points.
         max_iters (int): Number of training iterations.
     """
-    
+    # printing some basic information
+    print(f"Running experiment with LF: {num_LF}, HF: {num_HF}, Holdout: {holdout_idx}")
+
+    exp_folder = os.path.join(output_folder, f"LF{num_LF}_HF{num_HF}_Holdout{holdout_idx}")
+    if os.path.exists(exp_folder):
+        print(f"Experiment {exp_folder} already exists. Skipping...")
+        return
+    # Create the output directory
+    os.makedirs(exp_folder, exist_ok=True)
+
     X_LF, Y_LF = data.X_train_norm[0][:num_LF], data.Y_train_norm_log10[0][:num_LF]
     X_HF, Y_HF = np.delete(data.X_train_norm[1], holdout_idx, axis=0), np.delete(data.Y_train_norm_log10[1], holdout_idx, axis=0)
     X_test_HF, Y_test_HF = data.X_train_norm[1][holdout_idx:holdout_idx+1], data.Y_train_norm_log10[1][holdout_idx:holdout_idx+1]
-    
+    print(f"LF shape: {X_LF.shape}, HF shape: {X_HF.shape}, Test HF shape: {X_test_HF.shape}")
+
     X_LF_aug = np.hstack([X_LF, np.zeros((X_LF.shape[0], 1))])
     X_HF_aug = np.hstack([X_HF, np.ones((X_HF.shape[0], 1))])
     X_train = np.vstack([X_LF_aug, X_HF_aug])
@@ -61,8 +71,6 @@ def run_experiment(data, num_LF, num_HF, holdout_idx, output_folder, num_latents
     residuals = mean_pred.numpy() - Y_test_HF
     relative_error = np.abs(10**mean_pred / 10**Y_test_HF - 1)
     
-    exp_folder = os.path.join(output_folder, f"LF{num_LF}_HF{num_HF}_Holdout{holdout_idx}")
-    os.makedirs(exp_folder, exist_ok=True)
     
     save_txt(10**mean_pred, os.path.join(exp_folder, "predictions.txt"))
     save_txt(var_pred.numpy(), os.path.join(exp_folder, "variances.txt"))
@@ -71,7 +79,7 @@ def run_experiment(data, num_LF, num_HF, holdout_idx, output_folder, num_latents
     save_txt(relative_error, os.path.join(exp_folder, "relative_error.txt"))
     save_txt(np.array([np.mean(residuals**2)]), os.path.join(exp_folder, "mean_squared_error.txt"))
 
-    mf_gp.save(os.path.join(exp_folder, "mf_gp_model"))
+    mf_gp.save_model(os.path.join(exp_folder, "mf_gp_model.pkl"))
     print(f"Experiment {exp_folder} completed.")
 
 def main():
@@ -81,10 +89,10 @@ def main():
     
     data = StellarMassFunctions(folder=args.data_folder)
     
-    num_LF_list = np.arange(100, 1005, 100)
+    num_LF_list = np.append(np.arange(100, 1005, 200), 1004)
     num_HF_list = np.arange(1, 8)
-    holdout_list = np.arange(8)
-    
+    holdout_list = np.arange(4)
+
     for num_LF in num_LF_list:
         for num_HF in num_HF_list:
             for holdout_idx in holdout_list:

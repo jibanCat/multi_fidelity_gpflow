@@ -44,6 +44,7 @@ def initialize_W(output_dim, num_latents, window_fraction=0.3, scale=0.1):
 
     return W_init * scale  # Scale for trainability
 
+
 class GraphLatentMF_SVGP(SVGP):
     def __init__(
         self,
@@ -52,41 +53,49 @@ class GraphLatentMF_SVGP(SVGP):
         num_outputs,
         latent_dims_list,
         Z,
-        lf_kernel_factories,  # list of callables to make base kernels
+        lf_kernel_factories,
         delta_kernel,
         window_fraction=0.4,
         scale=0.2,
     ):
+        """
+        Latent Graph Multi-Fidelity SVGP model:
+        - f_H(x) = sum_i rho_i f_{L_i}(x) + delta(x)
+        - Each f_{L_i}(x) = LinearCoregionalization(W_i @ latent GPs)
+        """
         self.num_outputs = num_outputs
         self.num_LF = len(latent_dims_list)
 
-        # 1. Create LinearCoregionalization kernel for each LF source
-        lf_kernels = []
-        for i, L_i in enumerate(latent_dims_list):
-            base_kernels = [lf_kernel_factories[i]() for _ in range(L_i)]
-            W_i = gpflow.Parameter(
-                initialize_W(num_outputs, L_i, window_fraction, scale),
-                trainable=True,
-            )
-            LMC_i = LinearCoregionalization(base_kernels, W=W_i)
-            lf_kernels.append(LMC_i)
+        # 1. Construct each f_{L_i}(x) = LinearCoregionalization(W_i @ latent GPs)
+        lf_multi_output_kernels = []
+        total_latents = 0
 
-        # 2. Construct GraphMultiFidelityKernel (no outer LMC!)
+        for i, L_i in enumerate(latent_dims_list):
+            base_kernels_i = [lf_kernel_factories[i]() for _ in range(L_i)]
+            W_i = gpflow.Parameter(
+                initialize_W(num_outputs, L_i, window_fraction, scale), trainable=True
+            )
+            LMC_i = LinearCoregionalization(base_kernels_i, W=W_i)
+            lf_multi_output_kernels.append(LMC_i)
+            total_latents += L_i
+
+        # 2. Build Graph MF Kernel
         graph_kernel = GraphMultiFidelityKernel(
-            kernel_L_list=lf_kernels,
+            kernel_L_list=lf_multi_output_kernels,
             kernel_delta=delta_kernel,
             num_output_dims=num_outputs,
         )
 
-        # 3. Shared inducing variables across L total latents
+        # 3. Inducing variable: shared across outputs
         inducing_variable = SharedIndependentInducingVariables(InducingPoints(Z))
 
         # 4. Variational parameters
-        total_latents = sum(latent_dims_list)
         q_mu = np.zeros((Z.shape[0], total_latents))
-        q_sqrt = np.repeat(np.eye(Z.shape[0])[None, ...], total_latents, axis=0) * 0.1
+        q_sqrt = np.repeat(
+            np.eye(Z.shape[0])[None, ...], total_latents, axis=0
+        ) * 0.1
 
-        # 5. Final SVGP
+        # 5. Final SVGP call
         likelihood = Gaussian()
         super().__init__(
             kernel=graph_kernel,
@@ -96,21 +105,9 @@ class GraphLatentMF_SVGP(SVGP):
             q_sqrt=q_sqrt,
         )
 
-    def optimize(self, data, max_iters=10000, initial_lr=0.005, unfix_noise_after=5000):
-        """
-        Optimizes the model using Adam with cosine decay.
-
-        Parameters:
-            data (tuple): Tuple `(X, Y)`, where:
-                - `X` is the training input `(N, D)`.
-                - `Y` is the training output `(N, P)`.
-            max_iters (int): Maximum number of optimization iterations.
-            initial_lr (float): Initial learning rate.
-            unfix_noise_after (int): Iteration at which to allow noise variance to be learned.
-        """
+    def optimize(self, data, max_iters=1000, initial_lr=0.01, unfix_noise_after=500):
         X, Y = data
-        schedule = tf.keras.optimizers.schedules.CosineDecay(initial_lr, max_iters)
-        optimizer = tf.optimizers.Adam(schedule)
+        optimizer = tf.optimizers.Adam(tf.keras.optimizers.schedules.CosineDecay(initial_lr, max_iters))
         self.loss_history = []
 
         @tf.function
@@ -127,36 +124,25 @@ class GraphLatentMF_SVGP(SVGP):
             self.loss_history.append(loss.numpy())
 
             if i == unfix_noise_after:
-                print(f"🔹 Unfixing noise variance at iteration {i}")
+                print("🔹 Unfixing noise variance at iteration", i)
                 gpflow.utilities.set_trainable(self.likelihood.variance, True)
 
-            if i % 20 == 0:
+            if i % 10 == 0:
                 print(f"🔹 Iteration {i}: ELBO = {-self.elbo((X, Y)).numpy()}")
 
     def save_model(self, filename="graph_latent_mf_svgp.pkl"):
-        """Saves the trained GraphLatentMF_SVGP model."""
+        import pickle
         params = gpflow.utilities.parameter_dict(self)
         with open(filename, "wb") as f:
             pickle.dump(params, f)
         print(f"✅ Model saved to {filename}")
 
     @staticmethod
-    def load_model(filename, constructor_args: tuple):
-        """
-        Loads the GraphLatentMF_SVGP model from disk.
-
-        Parameters:
-            filename (str): Path to saved model pickle.
-            constructor_args (tuple): Arguments used to initialize the model, e.g.
-                (X, Y, graph_kernel, num_latents, Z)
-
-        Returns:
-            GraphLatentMF_SVGP instance with loaded parameters.
-        """
+    def load_model(filename, *args):
+        import pickle
         with open(filename, "rb") as f:
             params = pickle.load(f)
-
-        model = GraphLatentMF_SVGP(*constructor_args)
+        model = GraphLatentMF_SVGP(*args)
         gpflow.utilities.multiple_assign(model, params)
         print(f"✅ Model loaded from {filename}")
         return model
