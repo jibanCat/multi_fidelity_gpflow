@@ -25,11 +25,9 @@ from .gpemulator_singlebin import _map_params_to_unit_cube as input_normalize
 CountModel = Literal["poisson", "jeffreys"]
 
 
-def infer_bin_width(centers: np.ndarray, edges: Optional[np.ndarray] = None) -> np.ndarray:
+def infer_bin_width(centers: np.ndarray, edges: Optional[np.ndarray] = None) -> float:
     """
-    Infer bin widths from centers or edges.
-
-    return the mean bin width.
+    Infer a single (uniform) bin width in dex from centers or edges.
     """
     centers = np.asarray(centers, dtype=float)
     if edges is not None:
@@ -37,26 +35,19 @@ def infer_bin_width(centers: np.ndarray, edges: Optional[np.ndarray] = None) -> 
         w = np.diff(edges)
         if np.any(w <= 0):
             raise ValueError("Non-positive bin widths from edges.")
-        return w.astype(np.float32)
+        return float(np.mean(w))
     diffs = np.diff(centers)
-    med = np.median(diffs)
-    # If nearly uniform, use the median spacing; else use mid-edge widths
-    if np.allclose(diffs, med, rtol=0, atol=1e-3):
-        return np.full_like(centers, med, dtype=np.float32)
-    left = np.r_[centers[0] - diffs[0] / 2, (centers[:-1] + centers[1:]) / 2]
-    right = np.r_[(centers[:-1] + centers[1:]) / 2, centers[-1] + diffs[-1] / 2]
-    return (right - left).astype(np.float32).mean()
-
+    return float(np.median(diffs))
 
 def to_counts(phi: np.ndarray, dlog10M: np.ndarray, Lbox: float) -> np.ndarray:
     """phi→counts for stacked snapshots.
     phi: (N, B*S), dlog10M: (B,), S snapshots → we tile widths to (B*S,).
     """
     phi = np.asarray(phi, dtype=float)
-    B = int(dlog10M.shape[0])
-    S = phi.shape[1] // B
-    d = np.tile(dlog10M, S)  # (B*S,)
+    # B = int(dlog10M.shape[0])
+    # S = phi.shape[1] // B
     V = float(Lbox) ** 3
+    d = float(dlog10M)
     return phi * (V * d)
 
 
@@ -85,14 +76,53 @@ def counts_uncertainty_stacked(
     frac_floor: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Uniform-bin version.
-    Returns (n_counts, sigma_phi, sigma_phi_total, sigma_A, sigma_n).
+    Compute Poisson/Jeffreys counting uncertainties for stacked SMFs.
 
-    - sigma_phi: 1σ in φ-space from Poisson/Jeffreys
-    - sigma_phi_total: with optional fractional floor added in quadrature
-    - sigma_A: 1σ in Anscombe space (via delta method)
-    - sigma_n: 1σ in counts space
+    Parameters
+    ----------
+    phi : np.ndarray, shape (N, B*S)
+        Stacked stellar mass functions. Each row corresponds to one parameter
+        setting (N). Columns are mass bins (B) repeated for each snapshot (S).
+        In other words, the SMFs from multiple snapshots are concatenated 
+        along axis=1 into a flattened layout.
+
+        Example:
+            If there are B=15 bins and S=4 snapshots, then each row will have
+            B*S = 60 columns ordered as:
+                [bins of snap1 | bins of snap2 | bins of snap3 | bins of snap4]
+
+    dlog10M : float
+        Uniform logarithmic bin width in dex (e.g. 0.30).
+        Must be a width, not bin centers.
+    Lbox : float
+        Simulation box length in (Mpc/h).
+    count_model : {"poisson", "jeffreys"}, default="jeffreys"
+        Model for count variance:
+          - "poisson": var(n) = n
+          - "jeffreys": var(n) = n + 0.5 (finite at n=0).
+    frac_floor : float, default=0.0
+        Optional fractional floor on φ-uncertainties. Added in quadrature.
+
+    Returns
+    -------
+    n : np.ndarray, shape (N, B*S)
+        Counts per bin (φ × V × Δlog10M).
+    sigma_phi : np.ndarray, shape (N, B*S)
+        1σ uncertainty in φ from counting statistics only.
+    sigma_phi_total : np.ndarray, shape (N, B*S)
+        Total φ-uncertainty, including optional fractional floor.
+    sigma_A : np.ndarray, shape (N, B*S)
+        1σ in Anscombe (variance-stabilizing) space via delta method.
+    sigma_n : np.ndarray, shape (N, B*S)
+        1σ in raw counts.
+
+    Notes
+    -----
+    - All outputs preserve the same (N, B*S) flattened shape as the input.
+    - If you want to treat snapshots separately, reshape afterwards to 
+      (N, S, B).
     """
+
     # Guardrail: centers mistakenly passed (typical ~8–12) vs widths (~0.1–0.5)
     if dlog10M > 1.0:
         raise ValueError(
@@ -222,9 +252,9 @@ class SMFDataLoaderSB28:
         # Standardize X if requested (fit on each fidelity separately by default)
         if self.standardize_X:
             # Normalize inputs to unit cube ([0, 1]^D) for each fidelity
-            self.X128 = input_normalize(self.X128_raw.iloc[:, self.cols].to_numpy(dtype=float), self.param_limits)
-            self.X256 = input_normalize(self.X256_raw.iloc[:, self.cols].to_numpy(dtype=float), self.param_limits)
-            self.X512 = input_normalize(self.X512_raw.iloc[:, self.cols].to_numpy(dtype=float), self.param_limits)            
+            self.X128 = input_normalize(self.df128.loc[:, self.cols].to_numpy(dtype=float), self.param_limits)
+            self.X256 = input_normalize(self.df256.loc[:, self.cols].to_numpy(dtype=float), self.param_limits)
+            self.X512 = input_normalize(self.df512.loc[:, self.cols].to_numpy(dtype=float), self.param_limits)            
         else:
             self.X128 = self.X128_raw
             self.X256 = self.X256_raw
@@ -268,7 +298,10 @@ class SMFDataLoaderSB28:
         df = pd.read_table(f"{self.paths.basedir}{filename}", sep=r"\s+", header=0, index_col=0)
         # Ensure consistent dtypes
         for c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="ignore")
+            try:
+                df[c] = pd.to_numeric(df[c])
+            except (ValueError, TypeError):
+                pass
         return df
 
     def _select_param_columns(self, df: pd.DataFrame) -> np.ndarray:
@@ -284,16 +317,57 @@ class SMFDataLoaderSB28:
         return X
 
     def _load_stack_smfs(self, pattern: str) -> np.ndarray:
+        """
+        Load and stack SMFs from multiple snapshots into a single 2D array.
+
+        Parameters
+        ----------
+        pattern : str
+            File name pattern with "{snap}" placeholder, e.g. "smf_snap{snap}.npy".
+            Each file is expected to have shape (N, B), where:
+            - N = number of parameter samples or realizations
+            - B = number of stellar mass bins
+
+        Returns
+        -------
+        stacked : (N, B*S) ndarray
+            Stacked SMFs, with snapshots concatenated along the second axis:
+            [bins of snapshot 0 | bins of snapshot 1 | ... | bins of snapshot S-1].
+            - First dimension (rows) = same N across snapshots
+            - Second dimension (columns) = B bins × S snapshots
+        """        
         arrays = []
         for snap in self.snapshots:
             path = f"{self.paths.basedir}{pattern.format(snap=snap)}"
             arr = np.load(path, allow_pickle=True)
+
+            # Each file must be 2D: (N, B)
             if arr.ndim != 2 or arr.shape[1] != self.B:
                 raise ValueError(f"Unexpected SMF shape in {path}: {arr.shape}, expected (N, {self.B})")
+
             arrays.append(arr)
-        return np.concatenate(arrays, axis=1)  # (N, B*S)
+
+        # Concatenate snapshots along columns
+        return np.concatenate(arrays, axis=1)  # final shape: (N, B*S)
 
     def _build_targets(self, phi_stack: np.ndarray) -> np.ndarray:
+        """
+        Build target space from stacked SMFs.
+        Parameters
+        ----------
+        phi_stack : (N, B*S) ndarray
+            Stacked SMFs in φ-space, where:
+            - N = number of parameter samples or realizations
+            - B = number of stellar mass bins
+            - S = number of snapshots (e.g., 2 for snapshots 73 and 90)
+        Returns
+        -------
+        targets : (N, B*S) ndarray
+            Targets in the requested space:
+            - If `y_transform` is "phi", returns φ directly.
+            - If `y_transform` is "counts", converts φ to counts using the bin width and box size.
+            - If `y_transform` is "anscombe", applies the Anscombe transformation to counts.
+        """
         if self.y_transform == "phi":
             return phi_stack.astype(float)
         elif self.y_transform == "counts":
@@ -314,19 +388,14 @@ class SMFDataLoaderSB28:
         - σ_Y (standardized Anscombe, to match Y*_norm)
         """
         (self.counts128, self.sigma_phi128, self.sigma_phi128_total, self.sigma_A128, self.sigma_counts128) = counts_uncertainty_stacked(
-            self._phi128, self.dlog10M, self.Lbox, count_model=count_model, frac_floor=frac_floor
+            self.PHI128, self.dlog10M, self.Lbox, count_model=count_model, frac_floor=frac_floor
         )
         (self.counts256, self.sigma_phi256, self.sigma_phi256_total, self.sigma_A256, self.sigma_counts256) = counts_uncertainty_stacked(
-            self._phi256, self.dlog10M, self.Lbox, count_model=count_model, frac_floor=frac_floor
+            self.PHI256, self.dlog10M, self.Lbox, count_model=count_model, frac_floor=frac_floor
         )
         (self.counts512, self.sigma_phi512, self.sigma_phi512_total, self.sigma_A512, self.sigma_counts512) = counts_uncertainty_stacked(
-            self._phi512, self.dlog10M, self.Lbox, count_model=count_model, frac_floor=frac_floor
+            self.PHI512, self.dlog10M, self.Lbox, count_model=count_model, frac_floor=frac_floor
         )
-
-        # Standardized Anscombe-space uncertainties to pair with Y*_norm
-        self.sigma_Y128 = self.sigma_A128 / self.Y128_stats["sd"]
-        self.sigma_Y256 = self.sigma_A256 / self.Y256_stats["sd"]
-        self.sigma_Y512 = self.sigma_A512 / self.Y512_stats["sd"]
 
     # ------------------------- Public helpers -------------------------
     def get_training(self, fidelity: Literal["n128", "n256", "n512"]) -> Tuple[np.ndarray, np.ndarray]:
@@ -357,31 +426,6 @@ class SMFDataLoaderSB28:
         ax.set_ylabel(r"$\phi\;[h^3\,\mathrm{Mpc}^{-3}\,\mathrm{dex}^{-1}]$")
         ax.grid(True, ls=":", alpha=0.4)
         ax.legend(ncol=2)
-        return ax
-
-    def plot_uncertainty_bands(
-        self,
-        fidelity: Literal["n128", "n256", "n512"],
-        sim_idx: int,
-        count_model: CountModel = "jeffreys",
-        frac_floor: float = 0.0,
-        ax: Optional[plt.Axes] = None,
-    ) -> plt.Axes:
-        phi_map = {"n128": self.PHI128, "n256": self.PHI256, "n512": self.PHI512}
-        phi = phi_map[fidelity]
-        _, sigma_phi, _ = counts_uncertainty(phi, self.dlog10M, self.Lbox, count_model, frac_floor)
-        if ax is None:
-            fig, ax = plt.subplots(figsize=(8, 5))
-        for s_i, snap in enumerate(self.snapshots):
-            start, end = s_i * self.B, (s_i + 1) * self.B
-            m = phi[sim_idx, start:end]
-            s = sigma_phi[sim_idx, start:end]
-            ax.plot(self.log10M, m, label=f"{fidelity} (snap {snap})")
-            ax.fill_between(self.log10M, m - s, m + s, alpha=0.25)
-        ax.set_xlabel(r"$\log_{10} M_\star$")
-        ax.set_ylabel(r"$\phi$")
-        ax.legend()
-        ax.grid(True, ls=":", alpha=0.4)
         return ax
 
 
