@@ -26,6 +26,11 @@ CountModel = Literal["poisson", "jeffreys"]
 
 
 def infer_bin_width(centers: np.ndarray, edges: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    Infer bin widths from centers or edges.
+
+    return the mean bin width.
+    """
     centers = np.asarray(centers, dtype=float)
     if edges is not None:
         edges = np.asarray(edges, dtype=float)
@@ -40,7 +45,7 @@ def infer_bin_width(centers: np.ndarray, edges: Optional[np.ndarray] = None) -> 
         return np.full_like(centers, med, dtype=np.float32)
     left = np.r_[centers[0] - diffs[0] / 2, (centers[:-1] + centers[1:]) / 2]
     right = np.r_[(centers[:-1] + centers[1:]) / 2, centers[-1] + diffs[-1] / 2]
-    return (right - left).astype(np.float32)
+    return (right - left).astype(np.float32).mean()
 
 
 def to_counts(phi: np.ndarray, dlog10M: np.ndarray, Lbox: float) -> np.ndarray:
@@ -64,30 +69,65 @@ def inv_anscombe_mean_var(mA: np.ndarray, vA: np.ndarray) -> Tuple[np.ndarray, n
     var_n = (mA * 0.5) ** 2 * vA
     return n_hat, var_n
 
+def anscombe_sigma_from_counts_var(n: np.ndarray, var_n: np.ndarray) -> np.ndarray:
+    """
+    Delta-method 1σ for Anscombe A(n)=2*sqrt(n+3/8):
+    Var[A] ≈ Var[n] * (dA/dn)^2 = Var[n] / (n+3/8)
+    """
+    denom = n + 3.0/8.0
+    return np.sqrt(np.divide(var_n, denom, out=np.zeros_like(var_n, dtype=float), where=denom>0))
 
-def counts_uncertainty(
-    phi: np.ndarray,
-    dlog10M: np.ndarray,
-    Lbox: float,
+def counts_uncertainty_stacked(
+    phi: np.ndarray,          # (N, B*S) SMF in h^3 Mpc^-3 dex^-1
+    dlog10M: float,           # scalar bin width in dex (e.g., 0.30)
+    Lbox: float,              # box length in (Mpc/h)
     count_model: CountModel = "jeffreys",
     frac_floor: float = 0.0,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (n_counts, sigma_phi_model, sigma_phi_total) for stacked snapshots."""
-    n = to_counts(phi, dlog10M, Lbox)
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Uniform-bin version.
+    Returns (n_counts, sigma_phi, sigma_phi_total, sigma_A, sigma_n).
+
+    - sigma_phi: 1σ in φ-space from Poisson/Jeffreys
+    - sigma_phi_total: with optional fractional floor added in quadrature
+    - sigma_A: 1σ in Anscombe space (via delta method)
+    - sigma_n: 1σ in counts space
+    """
+    # Guardrail: centers mistakenly passed (typical ~8–12) vs widths (~0.1–0.5)
+    if dlog10M > 1.0:
+        raise ValueError(
+            f"dlog10M={dlog10M} looks like bin *centers*. "
+            "Pass a *width* in dex (e.g., 0.30)."
+        )
+
+    V = float(Lbox) ** 3
+    d = float(dlog10M)
+
+    # counts: n = φ * V * Δlog10M
+    n = phi * (V * d)
+
+    # count variance model
     if count_model == "poisson":
         var_n = np.clip(n, 0.0, None)
     elif count_model == "jeffreys":
-        var_n = np.clip(n + 0.5, 0.0, None)  # nonzero variance at n=0
+        var_n = np.clip(n + 0.5, 0.0, None)   # finite σ at n=0
     else:
         raise ValueError("count_model must be 'poisson' or 'jeffreys'")
-    B = dlog10M.shape[0]
-    S = phi.shape[1] // B
-    d = np.tile(dlog10M, S)
-    V = float(Lbox) ** 3
+
+    sigma_n = np.sqrt(var_n)
+
+    # propagate to φ: Var(φ) = Var(n)/(V d)^2
     var_phi = var_n / (V * d) ** 2
     sigma_phi = np.sqrt(var_phi)
-    sigma_total = np.sqrt(sigma_phi**2 + (frac_floor * np.abs(phi)) ** 2)
-    return n, sigma_phi, sigma_total
+
+    # optional numerical jitter in φ-space
+    sigma_phi_total = np.sqrt(sigma_phi**2 + (frac_floor * np.abs(phi))**2)
+
+    # Anscombe A(n)=2 sqrt(n+3/8): Var[A] ≈ Var[n]/(n+3/8)
+    denom = n + 3.0/8.0
+    sigma_A = np.sqrt(np.divide(var_n, denom, out=np.zeros_like(var_n), where=denom > 0))
+
+    return n, sigma_phi, sigma_phi_total, sigma_A, sigma_n
 
 
 # ------------------------- Standardization helpers -------------------------
@@ -171,15 +211,20 @@ class SMFDataLoaderSB28:
         self.X256_raw = self._select_param_columns(self.df256)
         self.X512_raw = self._select_param_columns(self.df512)
 
+        # info table includes the parameter limits
+        self.info = pd.read_table(
+            f"{self.paths.basedir}{self.paths.params_info}",
+            sep=r",",  # equivalent to delim_whitespace=True but future-proof
+        )
+        self.cols = self.info["ParamName"].values
+        self.param_limits = self.info.loc[:, ["MinVal", "MaxVal"]].to_numpy(dtype=float)
 
         # Standardize X if requested (fit on each fidelity separately by default)
         if self.standardize_X:
-            self.X128_stats = fit_standardizer(self.X128_raw)
-            self.X256_stats = fit_standardizer(self.X256_raw)
-            self.X512_stats = fit_standardizer(self.X512_raw)
-            self.X128 = apply_standardizer(self.X128_raw, self.X128_stats)
-            self.X256 = apply_standardizer(self.X256_raw, self.X256_stats)
-            self.X512 = apply_standardizer(self.X512_raw, self.X512_stats)
+            # Normalize inputs to unit cube ([0, 1]^D) for each fidelity
+            self.X128 = input_normalize(self.X128_raw.iloc[:, self.cols].to_numpy(dtype=float), self.param_limits)
+            self.X256 = input_normalize(self.X256_raw.iloc[:, self.cols].to_numpy(dtype=float), self.param_limits)
+            self.X512 = input_normalize(self.X512_raw.iloc[:, self.cols].to_numpy(dtype=float), self.param_limits)            
         else:
             self.X128 = self.X128_raw
             self.X256 = self.X256_raw
@@ -200,6 +245,9 @@ class SMFDataLoaderSB28:
         self.Y512_raw = self._build_targets(self.PHI512)
 
 
+        # Compute and store uncertainties for all fidelities (default: Jeffreys, no extra floor)
+        self.compute_and_store_uncertainties(count_model="jeffreys", frac_floor=0.0)
+
         if self.standardize_Y:
             self.Y128_stats = fit_standardizer(self.Y128_raw)
             self.Y256_stats = fit_standardizer(self.Y256_raw)
@@ -213,6 +261,7 @@ class SMFDataLoaderSB28:
             self.Y512 = self.Y512_raw
             D = self.Y128.shape[1]
             self.Y128_stats = self.Y256_stats = self.Y512_stats = {"mu": np.zeros(D), "sd": np.ones(D)}
+
 
     # ------------------------- Internals -------------------------
     def _read_param_table(self, filename: str) -> pd.DataFrame:
@@ -254,6 +303,30 @@ class SMFDataLoaderSB28:
             return anscombe(n)
         else:
             raise ValueError("y_transform must be 'phi', 'counts', or 'anscombe'")
+
+    def compute_and_store_uncertainties(self, count_model: CountModel = "jeffreys", frac_floor: float = 0.0) -> None:
+        """
+        Compute and store SMF uncertainties for each fidelity:
+        - counts n
+        - σ_φ (Poisson/Jeffreys in φ-space)
+        - σ_φ,total (with optional fractional floor)
+        - σ_A (Jeffreys/Poisson in Anscombe space)
+        - σ_Y (standardized Anscombe, to match Y*_norm)
+        """
+        (self.counts128, self.sigma_phi128, self.sigma_phi128_total, self.sigma_A128, self.sigma_counts128) = counts_uncertainty_stacked(
+            self._phi128, self.dlog10M, self.Lbox, count_model=count_model, frac_floor=frac_floor
+        )
+        (self.counts256, self.sigma_phi256, self.sigma_phi256_total, self.sigma_A256, self.sigma_counts256) = counts_uncertainty_stacked(
+            self._phi256, self.dlog10M, self.Lbox, count_model=count_model, frac_floor=frac_floor
+        )
+        (self.counts512, self.sigma_phi512, self.sigma_phi512_total, self.sigma_A512, self.sigma_counts512) = counts_uncertainty_stacked(
+            self._phi512, self.dlog10M, self.Lbox, count_model=count_model, frac_floor=frac_floor
+        )
+
+        # Standardized Anscombe-space uncertainties to pair with Y*_norm
+        self.sigma_Y128 = self.sigma_A128 / self.Y128_stats["sd"]
+        self.sigma_Y256 = self.sigma_A256 / self.Y256_stats["sd"]
+        self.sigma_Y512 = self.sigma_A512 / self.Y512_stats["sd"]
 
     # ------------------------- Public helpers -------------------------
     def get_training(self, fidelity: Literal["n128", "n256", "n512"]) -> Tuple[np.ndarray, np.ndarray]:
