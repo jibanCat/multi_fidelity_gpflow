@@ -231,6 +231,21 @@ class SMFDataLoaderSB28:
         self.standardize_Y = standardize_Y
         self.param_subset = param_subset
 
+        # info table includes the parameter limits
+        self.info = pd.read_table(
+            f"{self.paths.basedir}{self.paths.params_info}",
+            sep=r",",  # equivalent to delim_whitespace=True but future-proof
+        )
+        self.cols = self.info["ParamName"].values
+        self.param_limits = self.info.loc[:, ["MinVal", "MaxVal"]].to_numpy(dtype=float)
+        # LogFlag: 0 = linear, 1 = log
+        # GP is better handled in standardized space, so we just keep track of this
+        self.LogFlag = self.info["LogFlag"].values
+        # Transform the log-flagged parameters to log10 space in param limits
+        for i, flag in enumerate(self.LogFlag):
+            if flag == 1:
+                self.param_limits[i, :] = np.log10(self.param_limits[i, :])
+
         # Load parameter tables
         self.df128 = self._read_param_table(paths.params_n128)
         self.df256 = self._read_param_table(paths.params_n256)
@@ -241,13 +256,6 @@ class SMFDataLoaderSB28:
         self.X256_raw = self._select_param_columns(self.df256)
         self.X512_raw = self._select_param_columns(self.df512)
 
-        # info table includes the parameter limits
-        self.info = pd.read_table(
-            f"{self.paths.basedir}{self.paths.params_info}",
-            sep=r",",  # equivalent to delim_whitespace=True but future-proof
-        )
-        self.cols = self.info["ParamName"].values
-        self.param_limits = self.info.loc[:, ["MinVal", "MaxVal"]].to_numpy(dtype=float)
 
         # Standardize X if requested (fit on each fidelity separately by default)
         if self.standardize_X:
@@ -302,6 +310,15 @@ class SMFDataLoaderSB28:
                 df[c] = pd.to_numeric(df[c])
             except (ValueError, TypeError):
                 pass
+
+        # Transform log-flagged parameters to log10 space
+        for i, flag in enumerate(self.LogFlag):
+            if flag == 1:
+                col = self.cols[i]
+                if col in df.columns:
+                    df[col] = np.log10(df[col].to_numpy(dtype=float))
+                else:
+                    raise KeyError(f"Expected log-flagged column '{col}' not found in {filename}")
         return df
 
     def _select_param_columns(self, df: pd.DataFrame) -> np.ndarray:
