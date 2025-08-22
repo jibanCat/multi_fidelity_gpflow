@@ -54,7 +54,7 @@ class LatentMFCoregionalizationSVGP(SVGP):
     - **Stable Optimization** using better parameter initialization.
     """
 
-    def __init__(self, X, Y, kernel_L, kernel_delta, num_latents, num_inducing, num_outputs, heterosed=False, window_fraction=0.4, scale=0.2):
+    def __init__(self, X, Y, kernel_L, kernel_delta, num_latents, num_inducing, num_outputs, heterosed=False, window_fraction=0.4, scale=0.2, variance = np.array([1.0], dtype=np.float64)):
         """
         Initializes the Multi-Fidelity SVGP model.
         Note: All the data (X, Y or even the paramterts in kernel_L and kernel_delta) are 
@@ -98,11 +98,10 @@ class LatentMFCoregionalizationSVGP(SVGP):
 
         # ✅ Define SVGP Model
         # one learnable parameter for the noise variance in the likelihood
-        variance = np.array([1.0], dtype=np.float64)
         if heterosed:
             self.likelihood = HeteroscedasticGaussian(variance=variance)
         else:
-            self.likelihood = Gaussian(variance=variance)  
+            self.likelihood = Gaussian(variance=variance)
         super().__init__( kernel=self.kernel,
                          likelihood=self.likelihood,
                          inducing_variable=inducing_variable,
@@ -142,16 +141,22 @@ class LatentMFCoregionalizationSVGP(SVGP):
             optimizer.apply_gradients(zip(grads, self.trainable_variables))
             return loss
 
+        # Fix the noise variance to a constant value for the first `unfix_noise_after` iterations.
+        # The benefit of this is that the model can learn the latent structure without being influenced by the noise variance.
+        # It's a common practice in GP because the noise variance can be very sensitive to the initial conditions.
+        gpflow.utilities.set_trainable(self.likelihood.variance, False)
+
         # Run the optimization loop, reusing the same tf.function.
         for i in range(len(self.loss_history), max_iters):
             loss = optimization_step(X, Y)
             self.loss_history.append(loss.numpy())
             if i%100 == 0:
-                print(f"🔹 Iteration {i}: ELBO = {-self.elbo((X, Y)).numpy()}", flush=True)
+                print(f"🔹 Iteration {i}: ELBO = {loss.numpy()}", flush=True)
 
             # Optionally, set the likelihood's noise variance to be trainable at a given iteration.
             if i == unfix_noise_after:   
-                self.likelihood.variance.trainable = True
+                gpflow.utilities.set_trainable(self.likelihood.variance, True)
+                # self.likelihood.variance.trainable = True
 
 
     def save_model(self, filename="latent_mf_svgp.pkl"):
@@ -188,7 +193,11 @@ class HeteroscedasticGaussian(gpflow.likelihoods.Gaussian):
     """
     def __init__(self, variance):
         # Ensure the variance is wrapped as a trainable parameter with a positivity transform.
-        variance = gpflow.Parameter(variance, transform=gpflow.utilities.positive())
+        self.variance = gpflow.Parameter(
+            np.array(variance, dtype=np.float64),  # scalar or (P,)
+            transform=gpflow.utilities.positive()
+        )
+
         super().__init__(variance=variance)
 
     def _variational_expectations(self, X, Fmu, Fvar, Y):
