@@ -3,6 +3,10 @@ import tensorflow as tf
 import numpy as np
 import pickle
 from copy import deepcopy
+
+import tensorflow_probability as tfp
+tfd = tfp.distributions
+
 from gpflow import Parameter
 from gpflow.utilities import positive
 
@@ -102,6 +106,17 @@ class LatentMFCoregionalizationSVGP(SVGP):
             self.likelihood = HeteroscedasticGaussian(variance=variance)
         else:
             self.likelihood = Gaussian(variance=variance)
+
+        # set a prior on the baseline noise variance to avoid it going to zero
+        # Put a (factorised) LogNormal prior on each element
+        if variance.shape == (1,):
+            self.likelihood.variance.prior = tfd.LogNormal(np.log(variance), 0.5)
+        else:
+            self.likelihood.variance.prior = tfd.Independent(
+                tfd.LogNormal(loc=np.log(variance), scale=0.5),
+                reinterpreted_batch_ndims=1,   # treat vector as product of independent priors
+            )
+
         super().__init__( kernel=self.kernel,
                          likelihood=self.likelihood,
                          inducing_variable=inducing_variable,
@@ -136,7 +151,25 @@ class LatentMFCoregionalizationSVGP(SVGP):
         @tf.function
         def optimization_step(X, Y):
             with tf.GradientTape() as tape:
-                loss = -self.elbo((X, Y))
+                nelbo = -self.elbo((X, Y))
+                # W regularizer: encourage columns not to coalesce
+                W = self.kernel.W
+                WTW = tf.linalg.matmul(tf.transpose(W), W)
+                ortho_pen = tf.reduce_sum((WTW - tf.eye(WTW.shape[0], dtype=WTW.dtype))**2)
+
+                # 1) Column-norm anchoring: keep each column near a target norm c (e.g. c ≈ 1/sqrt(P))
+                output_dim = self.num_outputs
+                c = 1.0 / np.sqrt(output_dim)
+                col_norms = tf.sqrt(tf.reduce_sum(self.kernel.W**2, axis=0) + 1e-12)
+                norm_pen = tf.reduce_sum((col_norms - c)**2)
+
+                # 2) Column-presence penalty: discourage “dead” columns
+                presence_pen = tf.reduce_sum(tf.nn.relu(0.3*c - col_norms))  # hinge
+
+                # Total reg (use tiny weights)
+                loss = nelbo + 1e-4 * ortho_pen + 1e-4 * norm_pen + 1e-5 * presence_pen
+                # loss = nelbo + 1e-4 * reg  # λ as small as needed
+
             grads = tape.gradient(loss, self.trainable_variables)
             optimizer.apply_gradients(zip(grads, self.trainable_variables))
             return loss
@@ -145,6 +178,7 @@ class LatentMFCoregionalizationSVGP(SVGP):
         # The benefit of this is that the model can learn the latent structure without being influenced by the noise variance.
         # It's a common practice in GP because the noise variance can be very sensitive to the initial conditions.
         gpflow.utilities.set_trainable(self.likelihood.variance, False)
+        gpflow.utilities.set_trainable(self.kernel.W, False)
 
         # Run the optimization loop, reusing the same tf.function.
         for i in range(len(self.loss_history), max_iters):
@@ -154,9 +188,12 @@ class LatentMFCoregionalizationSVGP(SVGP):
                 print(f"🔹 Iteration {i}: ELBO = {loss.numpy()}", flush=True)
 
             # Optionally, set the likelihood's noise variance to be trainable at a given iteration.
-            if i == unfix_noise_after:   
+            if i == unfix_noise_after:
                 gpflow.utilities.set_trainable(self.likelihood.variance, True)
+                gpflow.utilities.set_trainable(self.kernel.W, True)
                 # self.likelihood.variance.trainable = True
+                # retrace so the now-trainable parameter is included in self.trainable_variables inside the graph
+                optimization_step = tf.function(optimization_step.python_function)
 
 
     def save_model(self, filename="latent_mf_svgp.pkl"):
@@ -192,11 +229,11 @@ class HeteroscedasticGaussian(gpflow.likelihoods.Gaussian):
     where self.variance is a (possibly vector-valued) baseline noise parameter.
     """
     def __init__(self, variance):
-        # Ensure the variance is wrapped as a trainable parameter with a positivity transform.
-        self.variance = gpflow.Parameter(
-            np.array(variance, dtype=np.float64),  # scalar or (P,)
-            transform=gpflow.utilities.positive()
-        )
+        # # Ensure the variance is wrapped as a trainable parameter with a positivity transform.
+        # self.variance = gpflow.Parameter(
+        #     np.array(variance, dtype=np.float64),  # scalar or (P,)
+        #     transform=gpflow.utilities.positive()
+        # )
 
         super().__init__(variance=variance)
 

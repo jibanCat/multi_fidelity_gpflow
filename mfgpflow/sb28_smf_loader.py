@@ -60,6 +60,17 @@ def inv_anscombe_mean_var(mA: np.ndarray, vA: np.ndarray) -> Tuple[np.ndarray, n
     var_n = (mA * 0.5) ** 2 * vA
     return n_hat, var_n
 
+def anscombe_to_phi(mA: np.ndarray, vA: np.ndarray, dlog10M: float, Lbox: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Convert Anscombe mean/variance to phi and its variance.
+    mA: (N, B*S) Anscombe mean, vA: (N, B*S) Anscombe variance.
+    Returns phi and its variance in (N, B*S).
+    """
+    n_hat, var_n = inv_anscombe_mean_var(mA, vA)
+    phi = n_hat / (float(Lbox) ** 3 * dlog10M)
+    var_phi = var_n / (float(Lbox) ** 3 * dlog10M) ** 2
+    return phi, var_phi
+
 def anscombe_sigma_from_counts_var(n: np.ndarray, var_n: np.ndarray) -> np.ndarray:
     """
     Delta-method 1σ for Anscombe A(n)=2*sqrt(n+3/8):
@@ -171,6 +182,10 @@ def fit_standardizer(Y: np.ndarray) -> Dict[str, np.ndarray]:
 def apply_standardizer(Y: np.ndarray, stats: Dict[str, np.ndarray]) -> np.ndarray:
     return (Y - stats["mu"]) / stats["sd"]
 
+def invert_standardizer(Y: np.ndarray, stats: Dict[str, np.ndarray]) -> np.ndarray:
+    """Inverse standardization."""
+    return Y * stats["sd"] + stats["mu"]
+
 
 # ------------------------- IO helpers -------------------------
 @dataclass
@@ -217,6 +232,7 @@ class SMFDataLoaderSB28:
         y_transform: Literal["phi", "counts", "anscombe"] = "anscombe",
         standardize_X: bool = True,
         standardize_Y: bool = True,
+        standardize_Y_128: bool = False,
         param_subset: Optional[List[str]] = None,
     ) -> None:
         self.paths = paths
@@ -229,6 +245,7 @@ class SMFDataLoaderSB28:
         self.y_transform = y_transform
         self.standardize_X = standardize_X
         self.standardize_Y = standardize_Y
+        self.standardize_Y_128 = standardize_Y_128
         self.param_subset = param_subset
 
         # info table includes the parameter limits
@@ -293,6 +310,37 @@ class SMFDataLoaderSB28:
             self.Y128 = apply_standardizer(self.Y128_raw, self.Y128_stats)
             self.Y256 = apply_standardizer(self.Y256_raw, self.Y256_stats)
             self.Y512 = apply_standardizer(self.Y512_raw, self.Y512_stats)
+            # Also apply standardization to uncertainties
+            # Variance propogation is : # σ_Y = σ_φ / σ_φ_std
+            # because Y = (φ - μ) / σ
+            self.sigma_phi128_standardized = self.sigma_phi128 / self.Y128_stats["sd"]
+            self.sigma_phi256_standardized = self.sigma_phi256 / self.Y256_stats["sd"]
+            self.sigma_phi512_standardized = self.sigma_phi512 / self.Y512_stats["sd"]
+            self.sigma_A128_standardized = self.sigma_A128 / self.Y128_stats["sd"]
+            self.sigma_A256_standardized = self.sigma_A256 / self.Y256_stats["sd"]
+            self.sigma_A512_standardized = self.sigma_A512 / self.Y512_stats["sd"]
+            self.sigma_counts128_standardized = self.sigma_counts128 / self.Y128_stats["sd"]
+            self.sigma_counts256_standardized = self.sigma_counts256 / self.Y256_stats["sd"]
+            self.sigma_counts512_standardized = self.sigma_counts512 / self.Y512_stats["sd"]
+
+        # Special case: only use Y128 standardization for all fidelities
+        elif self.standardize_Y_128:
+            self.Y128_stats = fit_standardizer(self.Y128_raw)
+            self.Y128 = apply_standardizer(self.Y128_raw, self.Y128_stats)
+            self.Y256 = apply_standardizer(self.Y256_raw, self.Y128_stats)
+            self.Y512 = apply_standardizer(self.Y512_raw, self.Y128_stats)
+            # Also apply standardization to uncertainties
+            self.sigma_phi128_standardized = self.sigma_phi128 / self.Y128_stats["sd"]
+            self.sigma_phi256_standardized = self.sigma_phi256 / self.Y128_stats["sd"]
+            self.sigma_phi512_standardized = self.sigma_phi512 / self.Y128_stats["sd"]
+            self.sigma_A128_standardized = self.sigma_A128 / self.Y128_stats["sd"]
+            self.sigma_A256_standardized = self.sigma_A256 / self.Y128_stats["sd"]
+            self.sigma_A512_standardized = self.sigma_A512 / self.Y128_stats["sd"]
+            self.sigma_counts128_standardized = self.sigma_counts128 / self.Y128_stats["sd"]
+            self.sigma_counts256_standardized = self.sigma_counts256 / self.Y128_stats["sd"]
+            self.sigma_counts512_standardized = self.sigma_counts512 / self.Y128_stats["sd"]
+
+        # If not standardizing Y, just keep raw values
         else:
             self.Y128 = self.Y128_raw
             self.Y256 = self.Y256_raw
