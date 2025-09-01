@@ -58,7 +58,7 @@ class LatentMFCoregionalizationSVGP(SVGP):
     - **Stable Optimization** using better parameter initialization.
     """
 
-    def __init__(self, X, Y, kernel_L, kernel_delta, num_latents, num_inducing, num_outputs, heterosed=False, window_fraction=0.4, scale=0.2, variance = np.array([1.0], dtype=np.float64)):
+    def __init__(self, X, Y, kernel_L, kernel_delta, num_latents, num_inducing, num_outputs, heterosed=False, window_fraction=0.4, scale=0.2, variance = np.array([1.0], dtype=np.float64), Z_init=None):
         """
         Initializes the Multi-Fidelity SVGP model.
         Note: All the data (X, Y or even the paramterts in kernel_L and kernel_delta) are 
@@ -95,10 +95,13 @@ class LatentMFCoregionalizationSVGP(SVGP):
         self.kernel = LinearCoregionalization(kernel_list, W=W)
 
         # ✅ Use KMeans to Find Good Inducing Points
-        kmeans = KMeans(n_clusters=num_inducing, random_state=42).fit(X)
-        Z_init = kmeans.cluster_centers_
-        #print("🔹 KMeans Inducing Points:", Z_init)
-        inducing_variable = SharedIndependentInducingVariables(InducingPoints(Z_init))
+        if Z_init is not None:
+            inducing_variable = SharedIndependentInducingVariables(InducingPoints(Z_init))
+        else:
+            kmeans = KMeans(n_clusters=num_inducing, random_state=42).fit(X)
+            Z_init = kmeans.cluster_centers_
+            #print("🔹 KMeans Inducing Points:", Z_init)
+            inducing_variable = SharedIndependentInducingVariables(InducingPoints(Z_init))
 
         # ✅ Define SVGP Model
         # one learnable parameter for the noise variance in the likelihood
@@ -127,132 +130,74 @@ class LatentMFCoregionalizationSVGP(SVGP):
 
         self.loss_history = []
 
-    def optimize(self,
-                data,
-                max_iters=10000, 
-                initial_lr=1e-2,
-                unfix_noise_after=500,        # when to unfreeze noise & W
-                beta0=0.7,                    # β-ELBO start (set to 1.0 to disable warm-up)
-                warmup=300,                   # steps to anneal β→1
-                nat_steps=3,                  # natgrad steps per outer iteration
-                renorm_every=100,             # how often to renormalize W columns
-                clip_global_norm=10.0,        # gradient clipping for Adam (None to disable)
-                ):
+    def optimize(self, data, max_iters=10000, initial_lr=0.005, unfix_noise_after=5000):
         """
-        Optimizes the model using NaturalGradient on (q_mu, q_sqrt) and Adam on hypers.
+        Optimizes the model using Adam with cosine decay.
+
+        Parameters:
+            data (tuple): Tuple `(X, Y)`, where:
+                - `X` is the training input `(N, D)`.
+                - `Y` is the training output `(N, P)`.
+            max_iters (int): Maximum number of optimization iterations.
+            initial_lr (float): Initial learning rate.
+            unfix_noise_after (int): Iteration at which to allow noise variance to be learned.
         """
         X, Y = data
-        dtype = gpflow.default_float()  # tf.float64 in your setup
+        optimizer = tf.optimizers.Adam(tf.keras.optimizers.schedules.CosineDecay(initial_lr, max_iters))
 
-        # ---------- helpers (Python) ----------
-        def _beta(i_py: int) -> tf.Tensor:
-            """
-            β(i) = beta0 + (1 - beta0) * min(1, i / warmup)  (computed in Python to avoid retracing spam)
-            """
-            if warmup <= 0:
-                b = float(beta0)
-            else:
-                frac = min(1.0, float(i_py) / float(warmup))
-                b = float(beta0) + (1.0 - float(beta0)) * frac
-            return tf.constant(b, dtype=dtype)
 
-        def _renorm_W():
-            # column-wise unit-norm; keeps scale in latent variances
-            W = self.kernel.W.read_value()
-            norms = tf.norm(W, axis=0, keepdims=True) + 1e-12
-            self.kernel.W.assign(W / norms)
-
-        def _neg_beta_elbo(data, beta_tensor: tf.Tensor):
-            """
-            Plain python function so we can safely sum self.prior_kl() which may return a list of Tensors.
-            """
-            elbo = self.elbo(data)
-            kl_terms = self.prior_kl()
-            if isinstance(kl_terms, (list, tuple)):
-                kl = tf.add_n(kl_terms) if len(kl_terms) > 1 else kl_terms[0]
-            else:
-                kl = kl_terms
-            one = tf.constant(1.0, dtype=elbo.dtype)
-            return -(elbo + (one - beta_tensor) * kl)
-
-        # ---------- optimizers ----------
-        lr = tf.keras.optimizers.schedules.CosineDecay(initial_lr, max_iters)
-        adam = tf.optimizers.Adam(lr)
-        natgrad = gpflow.optimizers.NaturalGradient(gamma=0.1)
-        var_list = [(self.q_mu, self.q_sqrt)]  # variational params for natgrad
-
-        # A single Adam step on hypers/W/Z/likelihood (excluding variational params)
-        @tf.function
-        def adam_step(i_tensor: tf.Tensor, X_tf, Y_tf):
-            beta = i_tensor  # we will pass β directly as a scalar tensor here
-
-            # Choose CURRENTLY-trainable non-variational params (avoid warnings for frozen vars)
-            adam_vars = tuple(
-                v for v in self.trainable_variables
-                if (v is not self.q_mu and v is not self.q_sqrt and v.trainable)
-            )
-
-            with tf.GradientTape() as tape:
-                nelbo_beta = _neg_beta_elbo((X_tf, Y_tf), beta)
-
-                # W regularizers (safe even when W is frozen; grads will be None and filtered below)
-                W = self.kernel.W
-                WTW = tf.linalg.matmul(tf.transpose(W), W)
-                ncols = tf.shape(WTW)[0]
-                I = tf.eye(ncols, dtype=W.dtype)
-                ortho_pen = tf.reduce_sum((WTW - I) ** 2)
-
-                c = tf.cast(1.0 / np.sqrt(self.num_outputs), W.dtype)
-                col_norms = tf.sqrt(tf.reduce_sum(W ** 2, axis=0) + 1e-12)
-                norm_pen = tf.reduce_sum((col_norms - c) ** 2)
-                presence_pen = tf.reduce_sum(tf.nn.relu(0.3 * c - col_norms))
-
-                loss = nelbo_beta + 1e-4 * ortho_pen + 1e-4 * norm_pen + 1e-5 * presence_pen
-
-            grads = tape.gradient(loss, adam_vars)
-            # filter out None grads (e.g., for frozen params)
-            grads_vars = [(g, v) for g, v in zip(grads, adam_vars) if g is not None]
-            if clip_global_norm is not None and grads_vars:
-                gs, _ = tf.clip_by_global_norm([g for g, _ in grads_vars], clip_global_norm)
-                grads_vars = list(zip(gs, [v for _, v in grads_vars]))
-            if grads_vars:
-                adam.apply_gradients(grads_vars)
-            return loss
-
-        # ---------- warmup & freezing ----------
-        # Warm up TFP cache (heteroscedastic paths need a first call)
+        # Warm up the TFP cache by calling elbo once outside the tf.function. Otherwise the code fails 
+        # for the heteroscedastic likelihood.
         _ = self.elbo((X, Y))
 
-        # Freeze noise & W initially to stabilize latent structure learning
+        # Define a reusable tf.function that accepts X and Y as arguments.
+        @tf.function
+        def optimization_step(X, Y):
+            with tf.GradientTape() as tape:
+                nelbo = -self.elbo((X, Y))
+                # W regularizer: encourage columns not to coalesce
+                W = self.kernel.W
+                WTW = tf.linalg.matmul(tf.transpose(W), W)
+                ortho_pen = tf.reduce_sum((WTW - tf.eye(WTW.shape[0], dtype=WTW.dtype))**2)
+
+                # 1) Column-norm anchoring: keep each column near a target norm c (e.g. c ≈ 1/sqrt(P))
+                output_dim = self.num_outputs
+                c = 1.0 / np.sqrt(output_dim)
+                col_norms = tf.sqrt(tf.reduce_sum(self.kernel.W**2, axis=0) + 1e-12)
+                norm_pen = tf.reduce_sum((col_norms - c)**2)
+
+                # 2) Column-presence penalty: discourage “dead” columns
+                presence_pen = tf.reduce_sum(tf.nn.relu(0.3*c - col_norms))  # hinge
+
+                # Total reg (use tiny weights)
+                loss = nelbo + 1e-3 * ortho_pen + 1e-3 * norm_pen + 1e-4 * presence_pen
+                # loss = nelbo + 1e-4 * reg  # λ as small as needed
+
+            grads = tape.gradient(loss, self.trainable_variables)
+            optimizer.apply_gradients(zip(grads, self.trainable_variables))
+            return loss
+
+        # Fix the noise variance to a constant value for the first `unfix_noise_after` iterations.
+        # The benefit of this is that the model can learn the latent structure without being influenced by the noise variance.
+        # It's a common practice in GP because the noise variance can be very sensitive to the initial conditions.
         gpflow.utilities.set_trainable(self.likelihood.variance, False)
         gpflow.utilities.set_trainable(self.kernel.W, False)
 
-        # ---------- training loop ----------
+        # Run the optimization loop, reusing the same tf.function.
         for i in range(len(self.loss_history), max_iters):
-            beta_i = _beta(i)
+            loss = optimization_step(X, Y)
+            self.loss_history.append(loss.numpy())
+            if i%100 == 0:
+                print(f"🔹 Iteration {i}: ELBO = {loss.numpy()}", flush=True)
 
-            # 1) a few NaturalGradient steps on (q_mu, q_sqrt) with the same β objective
-            for _ in range(nat_steps):
-                # natgrad expects a zero-arg callable
-                natgrad.minimize(lambda: _neg_beta_elbo((X, Y), beta_i), var_list)
-
-            # 2) one Adam step on hypers, W, Z, likelihood (if unfrozen)
-            # pass β as a Tensor to avoid retracing on Python scalars
-            loss = adam_step(beta_i, X, Y)
-            self.loss_history.append(float(loss.numpy()))
-
-            # column renorm periodically (helps identifiability)
-            if (i + 1) % renorm_every == 0 and self.kernel.W.trainable:
-                _renorm_W()
-
-            if i % 100 == 0:
-                print(f"🔹 Iteration {i}: objective = {loss.numpy()}", flush=True)
-
-            # Unfreeze after warmup
+            # Optionally, set the likelihood's noise variance to be trainable at a given iteration.
             if i == unfix_noise_after:
                 gpflow.utilities.set_trainable(self.likelihood.variance, True)
                 gpflow.utilities.set_trainable(self.kernel.W, True)
-                # no need to retrace adam_step — it re-selects vars each call
+                # self.likelihood.variance.trainable = True
+                # retrace so the now-trainable parameter is included in self.trainable_variables inside the graph
+                optimization_step = tf.function(optimization_step.python_function)
+
 
     def save_model(self, filename="latent_mf_svgp.pkl"):
         """Saves the trained SVGP model."""

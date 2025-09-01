@@ -233,6 +233,7 @@ class SMFDataLoaderSB28:
         standardize_X: bool = True,
         standardize_Y: bool = True,
         standardize_Y_128: bool = False,
+        standradize_Y_256: bool = False,
         param_subset: Optional[List[str]] = None,
     ) -> None:
         self.paths = paths
@@ -246,6 +247,7 @@ class SMFDataLoaderSB28:
         self.standardize_X = standardize_X
         self.standardize_Y = standardize_Y
         self.standardize_Y_128 = standardize_Y_128
+        self.standradize_Y_256 = standradize_Y_256
         self.param_subset = param_subset
 
         # info table includes the parameter limits
@@ -326,6 +328,8 @@ class SMFDataLoaderSB28:
         # Special case: only use Y128 standardization for all fidelities
         elif self.standardize_Y_128:
             self.Y128_stats = fit_standardizer(self.Y128_raw)
+            self.Y256_stats = self.Y128_stats
+            self.Y512_stats = self.Y128_stats
             self.Y128 = apply_standardizer(self.Y128_raw, self.Y128_stats)
             self.Y256 = apply_standardizer(self.Y256_raw, self.Y128_stats)
             self.Y512 = apply_standardizer(self.Y512_raw, self.Y128_stats)
@@ -339,6 +343,25 @@ class SMFDataLoaderSB28:
             self.sigma_counts128_standardized = self.sigma_counts128 / self.Y128_stats["sd"]
             self.sigma_counts256_standardized = self.sigma_counts256 / self.Y128_stats["sd"]
             self.sigma_counts512_standardized = self.sigma_counts512 / self.Y128_stats["sd"]
+
+        # Special case: only use Y256 standardization for all fidelities
+        elif self.standradize_Y_256:
+            self.Y256_stats = fit_standardizer(self.Y256_raw)
+            self.Y128_stats = self.Y256_stats
+            self.Y512_stats = self.Y256_stats
+            self.Y128 = apply_standardizer(self.Y128_raw, self.Y256_stats)
+            self.Y256 = apply_standardizer(self.Y256_raw, self.Y256_stats)
+            self.Y512 = apply_standardizer(self.Y512_raw, self.Y256_stats)
+            # Also apply standardization to uncertainties
+            self.sigma_phi128_standardized = self.sigma_phi128 / self.Y256_stats["sd"]
+            self.sigma_phi256_standardized = self.sigma_phi256 / self.Y256_stats["sd"]
+            self.sigma_phi512_standardized = self.sigma_phi512 / self.Y256_stats["sd"]
+            self.sigma_A128_standardized = self.sigma_A128 / self.Y256_stats["sd"]
+            self.sigma_A256_standardized = self.sigma_A256 / self.Y256_stats["sd"]
+            self.sigma_A512_standardized = self.sigma_A512 / self.Y256_stats["sd"]
+            self.sigma_counts128_standardized = self.sigma_counts128 / self.Y256_stats["sd"]
+            self.sigma_counts256_standardized = self.sigma_counts256 / self.Y256_stats["sd"]
+            self.sigma_counts512_standardized = self.sigma_counts512 / self.Y256_stats["sd"]
 
         # If not standardizing Y, just keep raw values
         else:
